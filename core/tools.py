@@ -32,6 +32,7 @@ class ExecResult:
     report: str        # 人读的验收报告
     files: dict        # 本次写入工作区的文件
     stdout: str = ""
+    artifacts: list = field(default_factory=list)  # 运行产生的新文件（交付物）
 
 
 # ---------------- 规格解析 ----------------
@@ -94,18 +95,30 @@ def _safe_relpath(name, ws: Path):
     return p
 
 
+def _cleanup_manifest_files(ws: Path, manifest_name):
+    """按清单文件删除上一轮写入的文件（规格文件 / 运行产物），清单本身保留"""
+    path = ws / manifest_name
+    if not path.exists():
+        return
+    try:
+        for old in json.loads(path.read_text(encoding="utf-8")):
+            p = _safe_relpath(old, ws)
+            if p and p.is_file():
+                p.unlink()
+    except (json.JSONDecodeError, OSError):
+        pass
+
+
 def prepare_workspace(trace_id, files):
-    """把规格里的文件写入工作区（先按清单清掉上一轮的旧文件），返回 (ws, written, skipped)"""
+    """把规格里的文件写入工作区。
+
+    先清掉上一轮的规格文件和运行产物（跨轮隔离：FILE_EXISTS 等产物断言
+    只认本轮真实生成的文件，不会被上一轮遗留物骗过），再写入本轮文件。
+    返回 (ws, written, skipped)
+    """
     ws = get_workspace_dir(trace_id)
-    manifest_path = ws / ".aegis_manifest.json"
-    if manifest_path.exists():
-        try:
-            for old in json.loads(manifest_path.read_text(encoding="utf-8")):
-                p = ws / old
-                if p.is_file():
-                    p.unlink()
-        except (json.JSONDecodeError, OSError):
-            pass
+    _cleanup_manifest_files(ws, ".aegis_manifest.json")   # 上一轮的规格文件
+    _cleanup_manifest_files(ws, ".aegis_artifacts.json")  # 上一轮的运行产物
     written, skipped = [], []
     for name, content in files.items():
         p = _safe_relpath(name, ws)
@@ -115,7 +128,7 @@ def prepare_workspace(trace_id, files):
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")
         written.append(p.relative_to(ws).as_posix())
-    manifest_path.write_text(json.dumps(written, ensure_ascii=False), encoding="utf-8")
+    (ws / ".aegis_manifest.json").write_text(json.dumps(written, ensure_ascii=False), encoding="utf-8")
     return ws, written, skipped
 
 
@@ -225,12 +238,16 @@ def run_workspace(trace_id, assertions, timeout=None):
 
     fails, passes = [], 0
     for line in assertions:
-        m = re.match(r"^(CONTAINS|NOT_CONTAINS|REGEX)\s*:\s*(.*)$", line, re.I)
+        m = re.match(r"^(CONTAINS|NOT_CONTAINS|REGEX|FILE_EXISTS)\s*:\s*(.*)$", line, re.I)
         kind, arg = (m.group(1).upper(), m.group(2)) if m else ("CONTAINS", line)
         if kind == "CONTAINS":
             good = arg in stdout
         elif kind == "NOT_CONTAINS":
             good = arg not in stdout
+        elif kind == "FILE_EXISTS":
+            # 产物断言：文件必须存在于工作区且非空（CSV/JSON/图片等交付物）
+            fp = _safe_relpath(arg, ws)
+            good = bool(fp and fp.is_file() and fp.stat().st_size > 0)
         else:
             good = bool(re.search(arg, stdout))
         if good:
@@ -261,8 +278,30 @@ def execute_spec(trace_id, spec_text):
     if not dep_msg.startswith(("无第三方依赖", "依赖未变化")):
         note += f"；{dep_msg}"
 
+    before = set(list_workspace_files(trace_id))
     ok, report, stdout = run_workspace(trace_id, spec.assertions)
-    return ExecResult(ok, note + "\n" + report, spec.files, stdout)
+    # 运行期间新产生的文件 = 本轮任务产物（CSV/JSON/图片等）。
+    # 产物清单累积登记（含历史轮次），保证下一轮 prepare_workspace 能全部清干净
+    artifacts = sorted(f for f in list_workspace_files(trace_id) if f not in before)
+    art_path = ws / ".aegis_artifacts.json"
+    try:
+        prev = json.loads(art_path.read_text(encoding="utf-8")) if art_path.exists() else []
+    except (json.JSONDecodeError, OSError):
+        prev = []
+    art_path.write_text(json.dumps(sorted(set(prev) | set(artifacts)), ensure_ascii=False), encoding="utf-8")
+    if artifacts:
+        sizes = ", ".join(f"{a}({_fmt_size((WORKSPACES_DIR / trace_id / a).stat().st_size)})"
+                          for a in artifacts)
+        report += f"\n本次运行新增产物: {sizes}"
+    return ExecResult(ok, note + "\n" + report, spec.files, stdout, artifacts)
+
+
+def _fmt_size(n):
+    if n >= 1024 * 1024:
+        return f"{n / 1024 / 1024:.1f}MB"
+    if n >= 1024:
+        return f"{n / 1024:.1f}KB"
+    return f"{n}B"
 
 
 # ==========================================
