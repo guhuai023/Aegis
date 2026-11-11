@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# IDE
+.idea/
+.vscode/
+
+# 运行数据与密钥
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+.env
+
+# 任务工作区（运行时产物）
+workspace/
+
+# 其他
+acl-recovery/

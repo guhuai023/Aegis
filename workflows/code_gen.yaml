@@ -1,0 +1,41 @@
+# Aegis 声明式工作流定义（预留接口）
+# 当前版本引擎尚未读取此文件；core/engine.py 仍以硬编码方式实现同样的 DAG。
+# 目标：未来由引擎加载此配置动态编排节点，新增工作流无需改代码。
+name: code_gen
+description: LLM 分诊 -> 代码生成/闲聊应答 -> 物理沙箱验证 -> 失败自动修复 -> 熔断人工介入
+entry: router
+
+nodes:
+  - id: router
+    type: llm
+    role: 智能调度系统的路由分发器，判断输入属于 [CODE] 还是 [CHAT]
+    routes:
+      "[CODE]": coder
+      "[CHAT]": chat_reply
+
+  - id: coder
+    type: llm
+    role: 结构化规格生成（requirements / assertions / 多文件），入口必须 main.py
+    next: verify
+
+  - id: verify
+    type: tool
+    tool: execute_spec   # 解析规格 -> 写任务工作区 -> 装依赖 -> 运行 -> 断言式验收
+    on_success: done
+    on_failure: fixer
+
+  - id: chat_reply
+    type: llm
+    role: 友好的AI助手
+    next: done
+
+  - id: fixer
+    type: llm
+    role: 排错专家，根据全部失败历史修复代码，只输出纯Python代码
+    next: sandbox
+    max_retries: 2
+    on_exhausted: human
+
+  - id: human
+    type: human_in_the_loop
+    on_resume: fixer   # 人工建议下发后重新进入 fixer，修复预算重置
