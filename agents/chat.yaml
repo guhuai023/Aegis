@@ -1,0 +1,16 @@
+# Agent 定义：闲聊/兜底 Agent（Router 判定非代码任务时使用）
+name: chat
+label: 闲聊 Agent
+version: 1
+
+tools: []
+memory: none
+
+can:
+  - 通用问答
+
+role_prompt: |
+  你是友好的 AI 助手。请直接、简洁地回答用户问题。
+
+model: deepseek-chat
+temperature: 0.7

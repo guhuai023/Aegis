@@ -1,209 +1,380 @@
+"""Aegis 控制台。
+
+职责边界：本文件只做**展示与下发**——任务怎么跑、什么时候停、算不算通过，
+全部由 core/ 里的编排引擎、Agent 注册表与工具注册表决定。
+视觉全部落在 ui/theme.py（原生 HTML/CSS），不依赖 Streamlit 内部 DOM 结构。
+"""
+import datetime
+import html as _html
+import json
 import os
-import uuid
 
 import streamlit as st
-import streamlit.components.v1 as components
 
-from core.db import init_db, create_task, get_conn, finish_task, log_event
-from core.engine import start_engine
+from core import db
+from core.agents import list_agents
+from core.config import DEFAULT_WORKFLOW, WORKER_COUNT
+from core.engine import get_workflow, resume_with_advice, start_engine, start_workflow
 from core.tools import get_workspace_dir, list_workspace_files
+from core.workflow import WorkflowError, list_workflows, to_dot
+from ui import theme
 
-st.set_page_config(page_title="Aegis 控制台", layout="wide")
+st.set_page_config(
+    page_title="Aegis 控制台",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+st.markdown(theme.CSS, unsafe_allow_html=True)
+db.init_db()
 
-# 初始化
-init_db()
+DEMO_PROMPT = (
+    "写一个函数，接收两个数字相除，并打印 10 / 0 的结果。"
+    "注意：禁止使用 try/except 等异常捕获，必须让除法真实执行。"
+)
+
+
+def _fill_prompt(text: str) -> None:
+    """示例需求回填。
+
+    必须走 on_click 回调：脚本跑到按钮时，侧边栏的 text_area(key="prompt_box")
+    早就实例化过了，此时直接写 st.session_state.prompt_box 会被 Streamlit 拒绝
+    （cannot be modified after the widget is instantiated）。回调在下一次脚本运行
+    之前执行，那时 widget 还不存在，赋值合法。
+    """
+    st.session_state.prompt_box = text
 
 
 @st.cache_resource
 def _boot_engine():
-    """引擎全局单例：整个 Streamlit 进程只启动一个 Worker，
-    避免旧版每个浏览器会话各起一个线程互相抢任务。"""
+    """引擎全局单例：整个 Streamlit 进程只启动一组 Worker，
+    避免每个浏览器会话各起一个线程互相抢任务。"""
     start_engine()
     return True
 
 
 _boot_engine()
 
-st.title("🛡️ Aegis: 多 Agent 智能体协同与可信交付平台")
+# ---------------------------------------------------------------- 工作流目录
+_wf_err = ""
+try:
+    _WORKFLOWS = list_workflows()
+except Exception as exc:            # 定义写坏也不要把整页拖垮
+    _WORKFLOWS = {}
+    _wf_err = str(exc)
+_wf_names = sorted(_WORKFLOWS) or [DEFAULT_WORKFLOW]
 
-if not os.environ.get("DEEPSEEK_API_KEY", "").strip():
-    st.sidebar.warning("⚠️ 未检测到 DEEPSEEK_API_KEY：请在项目根目录创建 .env（参考 .env.example）后重启应用")
-
-# 侧边栏下发任务
+# ---------------------------------------------------------------- 侧边栏
 with st.sidebar:
-    st.header("任务下发")
-    prompt = st.text_area(
-        "输入开发需求：",
-        "写一个函数，接收两个数字相除，并打印 10 / 0 的结果。"
-        "注意：禁止使用 try/except 等异常捕获，必须让除法真实执行。",
+    st.markdown(theme.brand(), unsafe_allow_html=True)
+
+    if not os.environ.get("DEEPSEEK_API_KEY", "").strip():
+        st.markdown(theme.warn_card(
+            "未检测到 DEEPSEEK_API_KEY —— 请在项目根目录按 .env.example 创建 .env 后重启。"
+            "缺少密钥时大模型节点会全部失败。"), unsafe_allow_html=True)
+    if _wf_err:
+        st.markdown(theme.warn_card(f"工作流定义加载失败：{_wf_err}"), unsafe_allow_html=True)
+
+    st.markdown('<div class="ag-sec">任务下发</div>', unsafe_allow_html=True)
+    if len(_wf_names) > 1:
+        wf_name = st.selectbox(
+            "工作流",
+            _wf_names,
+            index=_wf_names.index(DEFAULT_WORKFLOW) if DEFAULT_WORKFLOW in _wf_names else 0,
+            label_visibility="collapsed",
+        )
+    else:
+        wf_name = _wf_names[0]
+        st.caption(f"工作流：`{wf_name}`（目录下只有一个定义）")
+
+    _sel_spec = _WORKFLOWS.get(wf_name)
+    if _sel_spec is not None:
+        st.markdown(theme.kv([("节点", len(_sel_spec.nodes)),
+                              ("版本", f"v{_sel_spec.version}"),
+                              ("入口", _sel_spec.entry)]), unsafe_allow_html=True)
+
+    prompt = st.text_area("需求描述", DEMO_PROMPT, height=146, key="prompt_box")
+
+    if st.button("启动任务", type="primary", width="stretch"):
+        try:
+            trace_id = start_workflow(wf_name, prompt)
+            st.session_state.trace_id = trace_id
+            st.session_state.wf_name = wf_name
+            st.query_params["trace"] = trace_id
+            st.success(f"已下发 · trace `{trace_id}`")
+        except WorkflowError as exc:
+            st.error(f"工作流定义有误，未下发：\n{exc}")
+
+    # 最近任务（从任务黑板读，纯展示）
+    try:
+        _recent = db.recent_traces(6)
+    except Exception:
+        _recent = []
+    if _recent:
+        st.markdown('<div class="ag-sec">最近任务</div>', unsafe_allow_html=True)
+        for _tid, _n, _wf, _stt, _ts in _recent:
+            st.markdown(theme.trace_row(_tid, _stt or "pending", _ts or "—"),
+                        unsafe_allow_html=True)
+        if st.button("打开最近一条", width="stretch"):
+            st.session_state.trace_id = _recent[0][0]
+            st.session_state.pop("wf_name", None)
+            st.query_params["trace"] = _recent[0][0]
+            st.rerun()
+
+    st.markdown(theme.footer("aegis · workflows/*.yaml"),
+                unsafe_allow_html=True)
+
+
+# ---------------------------------------------------------------- 数据读取
+def _current_spec():
+    """当前 trace 用的工作流定义（优先按 trace 记忆里的名字取）"""
+    name = st.session_state.get("wf_name")
+    trace_id = st.session_state.get("trace_id")
+    if trace_id:
+        name = db.get_var(trace_id, "workflow", name)
+    try:
+        return get_workflow(name)
+    except WorkflowError as exc:
+        st.error(f"工作流定义加载失败：{exc}")
+        return None
+
+
+def _fetch_state(trace_id, spec):
+    conn = db.get_conn()
+    try:
+        node_ids = list(spec.nodes) if spec else []
+        states = db.node_statuses(trace_id, node_ids)
+        waiting = db.get_waiting_human(trace_id)
+        logs = conn.execute(
+            "SELECT timestamp, level, message FROM logs WHERE trace_id=? "
+            "ORDER BY id DESC LIMIT 40", (trace_id,)).fetchall()
+        stats = {
+            row[0]: (int(row[1] or 0), int(row[2] or 0))
+            for row in conn.execute(
+                "SELECT node_id, MAX(retry_count), COUNT(*) FROM tasks "
+                "WHERE trace_id=? GROUP BY node_id", (trace_id,)).fetchall()
+        }
+    finally:
+        conn.close()
+    return {"nodes": states, "human_task": waiting, "logs": logs, "stats": stats}
+
+
+# ---------------------------------------------------------------- 拓扑图
+def _render_graph(spec, states):
+    """执行拓扑：DOT 由 YAML 生成。
+
+    用 Streamlit 内置的 st.graphviz_chart，而不是 mermaid —— mermaid 要从 CDN 拉 JS，
+    比赛现场或内网一断网，图上就只剩一段源码；viz.js 是打包在 Streamlit 前端资源里的，
+    离线也能渲染。
+    """
+    dot = to_dot(spec, states)
+    try:
+        st.graphviz_chart(dot, width="stretch")
+    except TypeError:                      # 老版本不支持该参数
+        st.graphviz_chart(dot)
+
+
+# ---------------------------------------------------------------- 面板
+def _render_kpis(trace_id, spec):
+    state = _fetch_state(trace_id, spec)
+    states = list(state["nodes"].values())
+    done = states.count("done")
+    running = states.count("running")
+    failed = states.count("failed")
+    waiting = 1 if state["human_task"] else 0
+    steps = db.count_tasks(trace_id)
+
+    # LLM 用量：引擎把累计值写在 trace_vars["llm_usage"]
+    usage = {}
+    raw = db.get_var(trace_id, "llm_usage", "") or ""
+    if isinstance(raw, str) and raw.startswith("{"):
+        try:
+            usage = json.loads(raw)
+        except json.JSONDecodeError:
+            usage = {}
+
+    st.markdown(
+        theme.kpis([
+            ("已完成节点", done, theme.GREEN),
+            ("执行中", running, theme.BLUE2),
+            ("失败", failed, theme.RED),
+            ("待人工", waiting, theme.AMBER),
+            ("执行步数", steps, theme.BLUE),
+            ("工具调用", int(usage.get("tools", 0) or 0), theme.SLATE),
+            ("LLM tokens", int(usage.get("total", 0) or 0), theme.SLATE),
+        ]),
+        unsafe_allow_html=True,
     )
-    if st.button("🚀 启动工作流"):
-        trace_id = str(uuid.uuid4())[:8]
-        st.session_state.trace_id = trace_id
-        st.query_params["trace"] = trace_id  # 写入 URL，F5 刷新后追踪不丢失
-        create_task(trace_id, "router", prompt)
-        st.success(f"任务已下发！追踪ID: {trace_id}")
-
-C_MAP = {"done": "#4CAF50", "running": "#FFC107", "failed": "#F44336",
-         "waiting_human": "#9C27B0", "pending": "#E0E0E0"}
 
 
-def _fetch_state(trace_id):
-    conn = get_conn()
+def _render_live(trace_id, spec):
+    state = _fetch_state(trace_id, spec)
 
-    def get_status(nid):
-        rows = conn.execute("SELECT status FROM tasks WHERE trace_id=? AND node_id=?",
-                            (trace_id, nid)).fetchall()
-        statuses = [r[0] for r in rows]
-        if "waiting_human" in statuses: return "waiting_human"
-        if "failed" in statuses: return "failed"
-        if "running" in statuses or "pending" in statuses: return "running"
-        if "done" in statuses: return "done"
-        return "pending"
-
-    state = {
-        "router": get_status("router"),
-        "coder": get_status("coder"),
-        "fixer": get_status("fixer"),
-        "human": get_status("human"),
-        "human_task": conn.execute(
-            "SELECT task_id, input_context FROM tasks "
-            "WHERE trace_id=? AND status='waiting_human' ORDER BY rowid DESC LIMIT 1",
-            (trace_id,)).fetchone(),
-        "logs": conn.execute(
-            "SELECT timestamp, level, message FROM logs WHERE trace_id=? ORDER BY id DESC LIMIT 20",
-            (trace_id,)).fetchall(),
-    }
-    conn.close()
-    return state
+    st.markdown(theme.panel_head("执行拓扑", f"{spec.path.name} · {len(spec.nodes)} 节点"),
+                unsafe_allow_html=True)
+    with st.container(border=True):
+        _render_graph(spec, state["nodes"])
 
 
-def _render_live_panel(trace_id):
-    """实时面板：自动刷新拓扑图与执行日志"""
-    state = _fetch_state(trace_id)
-    st.subheader("📊 实时执行拓扑")
+    st.markdown(
+        theme.panel_head("节点明细", "最新状态")
+        + '<div class="ag-card">'
+        + theme.node_table(spec, state["nodes"], state["stats"])
+        + "</div>",
+        unsafe_allow_html=True,
+    )
 
-    mermaid_str = f"""
-            graph LR
-                R[分诊台 Router] --> C[开发 Agent]
-                C --> T{{物理验证锚点}}
-                T -->|报错| F[修复 Agent]
-                F --> T
-                F -.-> H{{人工介入}}
-                H -.-> F
-
-                style R fill:{C_MAP[state['router']]},color:#000
-                style C fill:{C_MAP[state['coder']]},color:#000
-                style T fill:{C_MAP[state['coder']]},color:#000
-                style F fill:{C_MAP[state['fixer']]},color:#000
-                style H fill:{C_MAP[state['human']]},color:#000
-            """
-
-    html_code = f"""
-            <html>
-            <body>
-                <script type="module">
-                    import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs';
-                    mermaid.initialize({{ startOnLoad: true, theme: 'default' }});
-                </script>
-                <pre class="mermaid" style="text-align: center;">
-                    {mermaid_str}
-                </pre>
-            </body>
-            </html>
-            """
-    # 用 iframe 嵌入网页，彻底避免 Streamlit 原生 markdown 渲染失败的问题
-    components.html(html_code, height=380)
-
-    st.subheader("📜 执行日志（最近 20 条）")
-    log_text = "\n".join(f"{ts} [{level}] {msg}" for ts, level, msg in state["logs"])
-    st.code(log_text if log_text else "暂无日志", language="text")
-
-    _render_deliverables(trace_id)
+    st.markdown(theme.panel_head("执行日志", f"最近 {len(state['logs'])} 条"),
+                unsafe_allow_html=True)
+    st.markdown(theme.log_list(state["logs"]), unsafe_allow_html=True)
 
 
-def _render_deliverables(trace_id):
-    """任务交付物：工作区文件预览与下载"""
-    files = list_workspace_files(trace_id)
-    with st.expander(f"📦 任务交付物（{len(files)} 个文件）", expanded=bool(files)):
+def _render_human(trace_id, spec):
+    state = _fetch_state(trace_id, spec)
+    human_task = state["human_task"]
+
+    with st.container(border=True):
+        st.markdown(theme.panel_head("人工介入中心", "熔断后自动接管"),
+                    unsafe_allow_html=True)
+        if human_task:
+            task_id, node_id, ctx = human_task
+            st.markdown(theme.warn_card(
+                f"节点 [{node_id}] 连续自动修复失败，已熔断：工作流停在 waiting_human，"
+                f"等待人类专家给出方向。"), unsafe_allow_html=True)
+            with st.expander("查看完整失败历史"):
+                st.code(ctx or "（无记录）", language="text")
+            advice = st.text_area(
+                "修复建议", height=110, key=f"advice_{task_id}",
+                placeholder="例如：捕获 ZeroDivisionError，提示“除数不能为零”并返回 None",
+            )
+            if st.button("提交建议并恢复", key=f"resume_{task_id}",
+                         type="primary", width="stretch"):
+                if advice.strip():
+                    try:
+                        target = resume_with_advice(trace_id, task_id, advice.strip())
+                    except WorkflowError as exc:
+                        st.error(f"恢复失败：{exc}")
+                        return
+                    st.success(f"建议已下发 → 恢复至 [{target}]（修复预算已重置）")
+                    if FRAGMENTS_OK:
+                        st.rerun(scope="fragment")
+                    else:
+                        st.rerun()
+                else:
+                    st.error("请先填写修复建议再提交")
+        else:
+            st.markdown(
+                '<div class="ag-card"><div style="padding:14px;color:#6B7788;font-size:.78rem;'
+                'line-height:1.6">当前没有等待人工介入的任务。<br>'
+                '当修复 Agent 连续失败达到 max_retries 预算时触发熔断，卡片会在几秒内自动出现。'
+                "</div></div>",
+                unsafe_allow_html=True,
+            )
+
+    # 交付物
+    with st.container(border=True):
+        files = list_workspace_files(trace_id)
+        st.markdown(theme.panel_head("任务交付物", f"{len(files)} 个文件"),
+                    unsafe_allow_html=True)
         if not files:
-            st.caption("工作区还没有产出文件（验收通过后代码会保存在 workspace/<追踪ID>/ 下）")
-            return
-        sel = st.selectbox("选择文件", files, key=f"dsel_{trace_id}")
-        try:
-            data = (get_workspace_dir(trace_id) / sel).read_bytes()
-        except OSError as e:
-            st.error(f"读取失败: {e}")
-            return
-        try:
-            st.code(data.decode("utf-8")[:3000], language="python")
-        except UnicodeDecodeError:
-            st.caption(f"二进制文件，共 {len(data)} 字节")
-        st.download_button("⬇️ 下载该文件", data=data, file_name=sel,
-                           key=f"dl_{trace_id}_{sel}")
+            st.markdown(theme.file_rows([], {}), unsafe_allow_html=True)
+        else:
+            sizes = {}
+            for name in files:
+                try:
+                    sizes[name] = (get_workspace_dir(trace_id) / name).stat().st_size
+                except OSError:
+                    sizes[name] = 0
+            st.markdown(theme.file_rows(files, sizes), unsafe_allow_html=True)
+            sel = st.selectbox("预览", files, key=f"dsel_{trace_id}",
+                               label_visibility="collapsed")
+            try:
+                data = (get_workspace_dir(trace_id) / sel).read_bytes()
+            except OSError as exc:
+                st.error(f"读取失败：{exc}")
+            else:
+                try:
+                    st.code(data.decode("utf-8")[:2600], language="python")
+                except UnicodeDecodeError:
+                    st.caption(f"二进制文件，共 {len(data)} 字节")
+                st.download_button("下载该文件", data=data, file_name=sel,
+                                   key=f"dl_{trace_id}_{sel}", width="stretch")
+
+    # 工作记忆
+    vars_ = db.get_vars(trace_id)
+    order = ["workflow", "prompt", "spec", "last_error", "advice"]
+    pairs = [(k, vars_[k]) for k in order if k in vars_]
+    pairs += [(k, v) for k, v in vars_.items() if k not in order]
+    st.markdown(theme.panel_head("trace 工作记忆", f"{len(pairs)} 个变量"),
+                unsafe_allow_html=True)
+    st.markdown(theme.var_list(pairs), unsafe_allow_html=True)
+
+    # 运行环境自证：同一个 trace 换台机器也该能复现
+    import platform
+    st.markdown(theme.panel_head("运行环境", "可复现性自证"), unsafe_allow_html=True)
+    st.markdown(theme.kv([
+        ("Python", platform.python_version()),
+        ("Worker", WORKER_COUNT),
+        ("Agent", len(list_agents())),
+        ("工作流", len(_WORKFLOWS)),
+        ("DB", "aegis_platform.db"),
+    ]), unsafe_allow_html=True)
 
 
-# streamlit >= 1.37 支持 fragment 定时自动局部刷新；老版本优雅降级为手动刷新
+# ---------------------------------------------------------------- 定时刷新
 FRAGMENTS_OK = True
 try:
-    _live_panel = st.fragment(run_every=3)(_render_live_panel)
-except AttributeError:
-    _live_panel = _render_live_panel
+    _kpis = st.fragment(run_every=3)(_render_kpis)
+    _live = st.fragment(run_every=3)(_render_live)
+    _human = st.fragment(run_every=5)(_render_human)
+except AttributeError:                        # streamlit < 1.37 优雅降级
     FRAGMENTS_OK = False
+    _kpis, _live, _human = _render_kpis, _render_live, _render_human
 
 
-def _render_human_center(trace_id):
-    """人工介入中心：熔断后卡片自动出现在这里（随 fragment 定时刷新）"""
-    state = _fetch_state(trace_id)
-    human_task = state["human_task"]
-    if human_task:
-        st.warning("🚨 Agent 多次自动修复失败，已熔断，等待人类专家建议！")
-        with st.expander("查看完整失败历史"):
-            st.code(human_task[1] or "（无记录）", language="text")
-        advice = st.text_area("你的修复建议：",
-                              placeholder="例如：捕获 ZeroDivisionError，打印'除数不能为零'",
-                              key=f"advice_{human_task[0]}")
-        if st.button("🩹 提交建议并恢复工作流", key=f"resume_{human_task[0]}"):
-            if advice.strip():
-                finish_task(human_task[0], "done", "人工建议已采纳")
-                resume_ctx = (f"{human_task[1]}\n\n【人工专家修复建议】：{advice.strip()}"
-                              "\n请严格按照人类建议修复代码。")
-                # 人工介入后重置修复预算：fixer 重新获得 3 次机会
-                create_task(trace_id, "fixer", resume_ctx, retry_count=0)
-                log_event(trace_id, "HUMAN", "🩹 收到人工建议，工作流已恢复（修复预算已重置）")
-                st.success("建议已下发，修复 Agent 已重新启动！")
-                if FRAGMENTS_OK:
-                    st.rerun(scope="fragment")
-                else:
-                    st.rerun()
-            else:
-                st.error("请先输入修复建议再提交")
-    else:
-        st.info("当前没有等待人工介入的任务。"
-                "当修复 Agent 连续失败达到上限触发熔断时，卡片会在几秒内自动出现在这里。")
-
-
-if FRAGMENTS_OK:
-    _human_center = st.fragment(run_every=5)(_render_human_center)
-else:
-    _human_center = _render_human_center
-
-
-if "trace_id" in st.session_state:
-    trace_id = st.session_state.trace_id
-    st.caption(f"当前追踪ID: `{trace_id}`")
-
-    left, right = st.columns([1, 1])
-
-    with left:
-        _live_panel(trace_id)
-
-    with right:
-        _human_center(trace_id)
-else:
-    # F5 刷新后从 URL 恢复追踪 ID，避免丢失正在执行的工作流
+# ---------------------------------------------------------------- 主区
+if "trace_id" not in st.session_state:
+    # F5 刷新后从 URL 恢复正在看的那条 trace
     restored = st.query_params.get("trace")
     if restored:
         st.session_state.trace_id = restored
         st.rerun()
-    st.info("👈 在左侧输入开发需求并点击「启动工作流」开始体验")
+    _d = _WORKFLOWS.get(DEFAULT_WORKFLOW)
+    st.markdown(theme.hero("", DEFAULT_WORKFLOW,
+                           getattr(_d, "version", None),
+                           len(getattr(_d, "nodes", {}) or {})),
+                unsafe_allow_html=True)
+    st.markdown(theme.empty_state(), unsafe_allow_html=True)
+    st.markdown(theme.panel_head("示例需求", "填进左侧输入框后可直接启动"), unsafe_allow_html=True)
+    _ex = [
+        ("生成销售汇总 CSV",
+         "生成一个 5 行的销售数据 CSV 到 sales.csv（列：日期,产品,数量,金额），并打印总金额。"),
+        ("爬取书籍信息",
+         "爬取 https://books.toscrape.com 首页的书名和价格，存成 books.csv，并打印抓到的条数。"),
+        ("演示熔断与人工介入", DEMO_PROMPT),
+    ]
+    for _label, _text in _ex:
+        _c1, _c2 = st.columns([4.8, 1], gap="small")
+        with _c1:
+            st.markdown(f'<div class="ag-ex"><b>{_label}</b><span>{_text}</span></div>',
+                        unsafe_allow_html=True)
+        with _c2:
+            st.button("填入", key=f"ex_{_label}", width="stretch",
+                      on_click=_fill_prompt, args=(_text,))
+    st.stop()
+
+trace_id = st.session_state.trace_id
+spec = _current_spec()
+if spec is None:
+    st.stop()
+
+st.markdown(theme.hero(trace_id, spec.name, spec.version, len(spec.nodes),
+                       tick=datetime.datetime.now().strftime("%H:%M:%S")),
+            unsafe_allow_html=True)
+
+_kpis(trace_id, spec)
+
+left, right = st.columns([1.58, 1], gap="medium")
+with left:
+    _live(trace_id, spec)
+with right:
+    _human(trace_id, spec)

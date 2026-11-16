@@ -1,41 +1,83 @@
-# Aegis 声明式工作流定义（预留接口）
-# 当前版本引擎尚未读取此文件；core/engine.py 仍以硬编码方式实现同样的 DAG。
-# 目标：未来由引擎加载此配置动态编排节点，新增工作流无需改代码。
+# Aegis 工作流定义：声明式编排（赛题「工作流编排」的核心载体）
+#
+# 引擎（core/engine.py）按本文件解释执行，Python 里不再有任何
+# if node_id == "router" / elif node_id == "coder" 这类硬编码分支。
+# 改流程只改这个文件，保存后无需重启（引擎按文件 mtime 热加载）。
+#
+# 本流程用到的控制结构：
+#   条件判断 routes            —— 分诊台按模型输出里的 [CODE] 标签路由
+#   循环迭代 on_failure + max_retries + on_exhausted —— 验收-修复 回边
+#   人工节点 human             —— 熔断后等外部输入，按 on_resume 恢复
 name: code_gen
-description: LLM 分诊 -> 代码生成/闲聊应答 -> 物理沙箱验证 -> 失败自动修复 -> 熔断人工介入
+version: 1
+description: >-
+  LLM 分诊 -> 结构化代码生成 -> 物理锚点验收 -> 失败自动修复（最多 2 次）->
+  熔断转人工介入 -> 人工建议下发后恢复并重置修复预算
 entry: router
 
 nodes:
+  # ---------------- 分诊 ----------------
   - id: router
     type: llm
-    role: 智能调度系统的路由分发器，判断输入属于 [CODE] 还是 [CHAT]
+    label: 分诊台 Router
+    agent: router
+    context: "{prompt}"
     routes:
-      "[CODE]": coder
-      "[CHAT]": chat_reply
+      "[CODE]": coder          # 条件分支：输出里出现 [CODE] 就去开发
+    next: chat_reply           # 兜底分支：没命中就当闲聊
 
+  # ---------------- 生成 ----------------
   - id: coder
     type: llm
-    role: 结构化规格生成（requirements / assertions / 多文件），入口必须 main.py
+    label: 开发 Agent
+    agent: coder
+    context: "{prompt}"
+    publish: spec              # 规格写进 trace 工作记忆，供 verify 节点取用
     next: verify
+    on_failure: fixer          # 大模型调用本身失败也进修复，不再静默判死
 
+  # ---------------- 验收（物理锚点） ----------------
+  # 注意：验收与生成是两个独立节点。coder/fixer 只负责「写」，
+  # 真正的判定发生在 execute_spec 这个 tool 节点里——生成方无法绕过验收。
   - id: verify
     type: tool
-    tool: execute_spec   # 解析规格 -> 写任务工作区 -> 装依赖 -> 运行 -> 断言式验收
+    label: 物理验收锚点
+    tool: execute_spec
+    context: "{spec}"          # 只吃规格，不关心是谁生成的
     on_success: done
     on_failure: fixer
+    max_retries: 2             # 验收失败最多再修 2 次（合计 3 次验收）
+    on_exhausted: human        # 预算耗尽 -> 熔断转人工
 
-  - id: chat_reply
-    type: llm
-    role: 友好的AI助手
-    next: done
-
+  # ---------------- 修复（循环回边） ----------------
   - id: fixer
     type: llm
-    role: 排错专家，根据全部失败历史修复代码，只输出纯Python代码
-    next: sandbox
-    max_retries: 2
-    on_exhausted: human
+    label: 修复 Agent
+    agent: fixer
+    context: |
+      原始需求：
+      {prompt}
 
+      【最近一次验收失败】
+      {last_error}
+
+      【当前代码文件】
+      {files}
+
+      请输出修复后的完整方案。
+    publish: spec
+    next: verify
+
+  # ---------------- 闲聊兜底 ----------------
+  - id: chat_reply
+    type: llm
+    label: 闲聊 Agent
+    agent: chat
+    context: "{prompt}"
+    on_success: done
+
+  # ---------------- 人工介入 ----------------
   - id: human
-    type: human_in_the_loop
-    on_resume: fixer   # 人工建议下发后重新进入 fixer，修复预算重置
+    type: human
+    label: 人工介入
+    on_resume: fixer           # 人工建议下发后回到修复节点，修复预算归零

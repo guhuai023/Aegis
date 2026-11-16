@@ -304,9 +304,151 @@ def _fmt_size(n):
     return f"{n}B"
 
 
-# ==========================================
-# 🌟 亮点预留：未来的 MCP / SAG-Wiki 扩展接口
-# ==========================================
-def search_local_knowledge(query):
-    """模拟接入外挂知识库（RAG/MCP）"""
-    return True, f"【知识库检索结果】：关于 '{query}' 的参考内容..."
+# ---------------- 工具注册表 ----------------
+# 工作流里的 tool 节点按名字取用：node.tool -> TOOL_REGISTRY[name]
+# 统一签名：fn(trace_id, input_text) -> ExecResult(ok / report / files / stdout)
+# 新增工具只需在这里注册，然后在 YAML 里写 tool: 名字，引擎不用改。
+TOOL_REGISTRY = {
+    "execute_spec": execute_spec,   # 解析规格 -> 写工作区 -> 装依赖 -> 真执行 -> 断言验收
+}
+
+
+def list_tools():
+    """给前端/文档用的工具清单"""
+    return sorted(TOOL_REGISTRY)
+
+
+# ---------------- Agent 可调用工具（Function Calling） ----------------
+# 与上面的 TOOL_REGISTRY 是两回事，别混：
+#   TOOL_REGISTRY  -> 工作流里的 **tool 节点**，由 YAML 指定、引擎无条件执行（如 execute_spec）
+#   AGENT_TOOLS    -> 暴露给 **模型本身**，模型在推理中自己决定调哪个、传什么参数，
+#                     引擎执行后把观察结果回灌，模型再继续推。
+# 这里只放"读代码 / 试跑代码"这类**探查**动作；落盘与验收仍然由 tool 节点的
+# execute_spec 统一负责，保证"通过"永远有物理依据，模型不能自己宣布成功。
+
+@dataclass
+class ToolContext:
+    """工具执行的边界：只能落到本 trace 的工作区里。"""
+    trace_id: str
+    workspace: Path
+
+
+TOOL_OUTPUT_LIMIT = 4000
+
+
+def _clip(text, limit=TOOL_OUTPUT_LIMIT):
+    text = str(text or "")
+    return text if len(text) <= limit else text[:limit] + f"\n…（已截断，共 {len(text)} 字）"
+
+
+def _tool_list_files(ctx: ToolContext, args: dict) -> str:
+    files = list_workspace_files(ctx.trace_id)
+    if not files:
+        return "（工作区暂无文件）"
+    return "工作区文件：\n" + "\n".join(files)
+
+
+def _tool_read_file(ctx: ToolContext, args: dict) -> str:
+    name = str(args.get("path") or "").strip()
+    p = _safe_relpath(name, ctx.workspace)
+    if p is None:
+        return f"错误：非法路径 {name!r}（只允许工作区内的相对路径）"
+    if not p.is_file():
+        return f"错误：文件不存在 {name}"
+    return _clip(p.read_text(encoding="utf-8", errors="replace"))
+
+
+def _tool_run_python(ctx: ToolContext, args: dict) -> str:
+    code = str(args.get("code") or "")
+    if not code.strip():
+        return "错误：code 为空"
+    ws = ctx.workspace
+    script = ws / ".aegis_tool_run.py"
+    script.write_text(code, encoding="utf-8")
+    vpy = _venv_python(ws)
+    py = str(vpy) if vpy.exists() else sys.executable
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
+    env.pop("PYTHONPATH", None)
+    try:
+        r = subprocess.run([py, script.name], capture_output=True, text=True,
+                           encoding="utf-8", errors="replace",
+                           timeout=SANDBOX_TIMEOUT, cwd=str(ws), env=env,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except subprocess.TimeoutExpired:
+        return f"错误：执行超时（>{SANDBOX_TIMEOUT}s）"
+    except Exception as e:
+        return f"错误：执行异常 {type(e).__name__}: {e}"
+    parts = [f"退出码 {r.returncode}"]
+    if (r.stdout or "").strip():
+        parts.append(r.stdout.rstrip())
+    if (r.stderr or "").strip():
+        parts.append("[stderr]\n" + r.stderr.rstrip())
+    if len(parts) == 1:
+        parts.append("(无输出)")
+    return _clip("\n".join(parts))
+
+
+AGENT_TOOLS = {
+    "list_files": {
+        "description": "列出当前任务工作区里的文件（相对路径），用于了解已有产物。",
+        "parameters": {"type": "object", "properties": {}, "required": []},
+        "fn": _tool_list_files,
+    },
+    "read_file": {
+        "description": "读取工作区内某个文件的完整内容。路径必须是相对路径。",
+        "parameters": {
+            "type": "object",
+            "properties": {"path": {"type": "string", "description": "工作区内的相对路径，如 main.py"}},
+            "required": ["path"],
+        },
+        "fn": _tool_read_file,
+    },
+    "run_python": {
+        "description": ("在工作区里真实执行一段 Python，返回退出码与 stdout/stderr。"
+                        "可用于复现报错、验证片段是否可跑。每次执行有超时限制。"),
+        "parameters": {
+            "type": "object",
+            "properties": {"code": {"type": "string", "description": "要执行的 Python 源码"}},
+            "required": ["code"],
+        },
+        "fn": _tool_run_python,
+    },
+}
+
+
+def tool_schemas(names):
+    """把 Agent 声明里的工具名翻译成 OpenAI tools 格式；未注册的名字直接忽略。"""
+    out = []
+    for name in names or []:
+        spec = AGENT_TOOLS.get(str(name))
+        if not spec:
+            continue
+        out.append({
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": spec["description"],
+                "parameters": spec["parameters"],
+            },
+        })
+    return out
+
+
+def call_tool(name, ctx: ToolContext, args: dict) -> str:
+    """执行一个工具调用。任何异常都转成文本返回给模型，绝不让引擎崩掉。"""
+    spec = AGENT_TOOLS.get(str(name))
+    if spec is None:
+        return f"错误：未注册的工具 {name}（可用: {', '.join(sorted(AGENT_TOOLS))}）"
+    if not isinstance(args, dict):
+        args = {}
+    try:
+        return str(spec["fn"](ctx, args))
+    except Exception as e:
+        return f"错误：工具 {name} 执行异常 {type(e).__name__}: {e}"
+
+
+def list_agent_tools():
+    """给前端/文档用：模型可调用的工具清单"""
+    return sorted(AGENT_TOOLS)

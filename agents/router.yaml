@@ -1,0 +1,23 @@
+# Agent 定义：分诊台
+# 赛题「Agent 团队定义与管理」的载体——角色、模型、工具集、记忆策略、版本都在这里声明，
+# 改角色只改 YAML，不改 Python。core/agents.py 负责加载与注册。
+name: router
+label: 分诊台 Router
+version: 1
+
+# 能力画像
+tools: []          # 该 Agent 可调用的工具（用于注册校验与前端能力展示）
+memory: none       # 记忆策略：none / trace（读取 trace 级工作记忆变量）
+can:
+  - 意图分类
+  - 动态路由
+
+role_prompt: |
+  你是智能调度系统的路由分发器。请判断用户的输入属于以下哪个场景：
+  - 如果用户要求写代码、写程序、排错，请输出: [CODE]
+  - 如果是其他任何问题（聊天、问好），请输出: [CHAT]
+  只输出上述标签，不要输出任何其他文字。
+
+model: deepseek-chat
+temperature: 0.0
+max_tokens: 64

@@ -1,0 +1,61 @@
+# 工作流定义：并行分支 + 汇合（演示「并行分支」控制结构）
+#
+# 这条流程不用于生产，作用是证明编排是数据：
+# 引擎没有为它改一行 Python，只靠 parallel / join 两个字段就多出
+# 一条两路并发扇出、等齐后汇总的 DAG。
+#
+# 选购/演示方法：把 core/config.py 的 DEFAULT_WORKFLOW 改成 parallel_demo，
+# 或者调用 engine.start_workflow("parallel_demo", prompt)。
+name: parallel_demo
+version: 1
+description: 任务拆解 -> 两路并发评估 -> join 等齐 -> 汇总输出
+entry: split
+
+nodes:
+  - id: split
+    type: llm
+    label: 任务拆分
+    agent: router
+    context: "{prompt}"
+    publish: split_plan
+    # 并行扇出：执行成功后同时创建 branch_a / branch_b 两个任务
+    parallel: [branch_a, branch_b]
+
+  - id: branch_a
+    type: llm
+    label: 分支A·可行性评估
+    agent: chat
+    context: |
+      请用 50 字以内，从「可行性」角度评价这个需求：{prompt}
+    publish: branch_a
+    next: merge
+
+  - id: branch_b
+    type: llm
+    label: 分支B·风险评估
+    agent: chat
+    context: |
+      请用 50 字以内，从「风险」角度评价这个需求：{prompt}
+    publish: branch_b
+    next: merge
+
+  - id: merge
+    type: join
+    label: 汇合
+    join: [branch_a, branch_b]     # 等这两个节点都 done 才放行
+    wait_timeout: 120
+    context: "{prompt}"
+    on_success: summarize
+    on_failure: failed
+
+  - id: summarize
+    type: llm
+    label: 汇总
+    agent: chat
+    context: |
+      【可行性评估】{branch_a}
+
+      【风险评估】{branch_b}
+
+      请合并成一段 100 字以内的最终结论。
+    on_success: done
