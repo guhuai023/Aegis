@@ -14,7 +14,9 @@ import streamlit as st
 from core import db
 from core.agents import list_agents
 from core.config import DEFAULT_WORKFLOW, WORKER_COUNT
-from core.engine import get_workflow, resume_with_advice, start_engine, start_workflow
+from core.engine import (
+    WORKER_STATE, get_workflow, resume_with_advice, start_engine, start_workflow,
+)
 from core.tools import get_workspace_dir, list_workspace_files
 from core.workflow import WorkflowError, list_workflows, to_dot
 from ui import theme
@@ -318,6 +320,16 @@ def _render_human(trace_id, spec):
         ("工作流", len(_WORKFLOWS)),
         ("DB", "aegis_platform.db"),
     ]), unsafe_allow_html=True)
+
+    # 调度器观测：能力分区 / 积压 / 最长等待——让"调度算法"在界面上可见
+    snap = db.scheduler_snapshot()
+    workers = [(name, w.get("caps", ["*"]), w.get("claimed", 0))
+               for name, w in sorted(WORKER_STATE.items())] or [("worker-0", ["*"], 0)]
+    st.markdown(theme.panel_head(
+        "调度器", f"{len(workers)} 个 Worker · 在跑 {snap.get('running', 0)}"),
+        unsafe_allow_html=True)
+    st.markdown(theme.worker_list(workers), unsafe_allow_html=True)
+    st.markdown(theme.sched_table(snap.get("buckets", [])), unsafe_allow_html=True)
 
 
 # ---------------------------------------------------------------- 定时刷新

@@ -40,3 +40,17 @@ MAX_FILE_CHARS_IN_CONTEXT = 3000
 
 # 每个任务的工作区根目录：workspace/<trace_id>/（代码文件、依赖、交付物都在这里）
 WORKSPACES_DIR = BASE_DIR / "workspace"
+
+# ---------------- 调度器 ----------------
+
+# Worker 能力分区：None = 每个 Worker 全能力（默认，单 Worker 时无差别）；
+# 给列表则每项是一个 Worker 的能力集合，用于"专职 Worker"演示，例如：
+#   [{"llm:coder", "llm:router", "llm:chat"}, {"tool:execute_spec", "join"}]
+WORKER_CAPABILITIES = None
+
+# 同时执行的 LLM 节点上限：多个 Worker 并发时防止把 provider 打爆触发限流
+MAX_LLM_CONCURRENCY = 2
+
+# 动态优先级老化（防饿死）：任务每等待 AGING_STEP 秒，有效优先级 +1，最多 +AGING_MAX
+AGING_STEP = 15
+AGING_MAX = 20

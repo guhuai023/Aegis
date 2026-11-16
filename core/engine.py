@@ -25,7 +25,8 @@ from core import db
 from core.agents import ask_agent_spec, get_agent
 from core.config import (
     DEFAULT_WORKFLOW, JOIN_POLL_SECONDS, MAX_FILE_CHARS_IN_CONTEXT,
-    MAX_FILES_IN_CONTEXT, MAX_STEPS_PER_TRACE, WORKER_COUNT, WORKSPACES_DIR,
+    MAX_FILES_IN_CONTEXT, MAX_LLM_CONCURRENCY, MAX_STEPS_PER_TRACE,
+    WORKER_CAPABILITIES, WORKER_COUNT, WORKSPACES_DIR,
 )
 from core.tools import (
     TOOL_REGISTRY, ToolContext, get_workspace_dir, list_workspace_files,
@@ -36,6 +37,12 @@ from core.workflow import (
 )
 
 _ENGINE_STARTED = False
+
+# 同时在跑的 LLM 节点上限：多 Worker 时把并发压在这里，避免把 provider 打爆（429）
+_LLM_SEM = threading.Semaphore(max(1, int(MAX_LLM_CONCURRENCY)))
+
+# Worker 运行时画像（认领数 / 当前任务 / 能力集），前端「调度器」卡展示用
+WORKER_STATE: dict[str, dict] = {}
 
 
 # ---------------------------------------------------------------- 工作流装载
@@ -56,7 +63,7 @@ def start_workflow(workflow_name: str, prompt: str, trace_id: str | None = None)
     trace_id = trace_id or uuid.uuid4().hex[:8]
     db.set_var(trace_id, "prompt", prompt)
     db.set_var(trace_id, "workflow", spec.name)
-    db.create_task(trace_id, spec.entry, prompt, 0, workflow=spec.name)
+    _new_task(spec, trace_id, spec.entry, prompt, 0)
     db.log_event(trace_id, "INFO",
                  f"🚀 工作流 [{spec.name}] v{spec.version} 启动，入口节点 [{spec.entry}]")
     return trace_id
@@ -78,27 +85,46 @@ def resume_with_advice(trace_id: str, task_id: str, advice: str) -> str:
 
     db.finish_task(task_id, "done", "人工建议已采纳")
     db.set_var(trace_id, "advice", advice)
-    db.create_task(trace_id, target, advice, 0, workflow=spec.name)  # retry 归零 = 预算重置
+    # retry 归零 = 修复预算重置；人工已介入，给最高优先级优先跑
+    _new_task(spec, trace_id, target, advice, 0, priority_boost=100)
     db.log_event(trace_id, "HUMAN",
                  f"🩹 收到人工建议，按 on_resume 恢复 -> [{target}]（修预算已重置）")
     return target
 
 
-def start_engine(workers: int | None = None) -> None:
-    """启动 Worker。认领是数据库层原子操作，多 Worker 可直接调大并发。"""
+def start_engine(workers: int | None = None, capabilities=None) -> None:
+    """启动 Worker。
+
+    workers       线程数（默认 WORKER_COUNT）；认领是数据库层原子操作，多 Worker 天然安全
+    capabilities  能力分区：None = 每个 Worker 全能力；给列表则每项是一个 Worker 的能力集合
+                  （例：一个专职跑 tool/join、一个专职跑 llm，用于演示能力匹配调度）
+    """
     global _ENGINE_STARTED
     if _ENGINE_STARTED:
         return
     _ENGINE_STARTED = True
     count = max(1, int(workers or WORKER_COUNT))
+    plan = capabilities if capabilities is not None else WORKER_CAPABILITIES
     for i in range(count):
-        threading.Thread(target=_worker_loop, name=f"aegis-worker-{i}", daemon=True).start()
-    print(f"🔥 [引擎] 已启动 {count} 个 Worker 线程，正在监听任务黑板")
+        caps = None
+        if plan:
+            caps = set(plan[i]) if i < len(plan) else set()
+        name = f"worker-{i}"
+        WORKER_STATE[name] = {
+            "caps": sorted(caps) if caps else ["*"],
+            "claimed": 0,
+            "last_task": None,
+        }
+        threading.Thread(target=_worker_loop, args=(name, caps),
+                         name=f"aegis-{name}", daemon=True).start()
+    detail = "，".join(f"{k}({len(v['caps']) if v['caps'] != ['*'] else '全能力'})"
+                       for k, v in WORKER_STATE.items())
+    print(f"🔥 [引擎] 已启动 {count} 个 Worker 线程：{detail}，正在监听任务黑板")
 
 
 # ---------------------------------------------------------------- Worker
 
-def _worker_loop():
+def _worker_loop(worker_name="worker-0", capabilities=None):
     try:
         recovered = db.recover_stale_tasks()
         if recovered:
@@ -108,7 +134,7 @@ def _worker_loop():
 
     while True:
         try:
-            _step()
+            _step(capabilities, worker_name)
         except Exception:
             print(f"🚨 [引擎] 调度异常\n{traceback.format_exc()}")
             try:
@@ -118,13 +144,20 @@ def _worker_loop():
         time.sleep(1)
 
 
-def _step():
-    """单步调度：认领 -> 执行 -> 算下一步 -> 落库。全程无业务分支硬编码。"""
-    task = db.claim_task()
+def _step(capabilities=None, worker_name="worker-0"):
+    """单步调度：认领 -> 执行 -> 算下一步 -> 落库。全程无业务分支硬编码。
+
+    capabilities 限定这个 Worker 能认领哪些任务（能力匹配），None = 不限。
+    """
+    task = db.claim_task(capabilities)
     if not task:
         return
     task_id, trace_id, node_id, context, retry, workflow_name = task
     retry = int(retry or 0)
+
+    state = WORKER_STATE.setdefault(worker_name, {"caps": ["*"], "claimed": 0, "last_task": None})
+    state["claimed"] = int(state.get("claimed", 0)) + 1
+    state["last_task"] = f"{node_id}@{trace_id}"
 
     # 兜底：防止 YAML 里的环没有预算限制
     if db.count_tasks(trace_id) > MAX_STEPS_PER_TRACE:
@@ -157,8 +190,7 @@ def _step():
             return
         if state == "wait":
             db.finish_task(task_id, "done", "等待并行分支汇合")
-            db.create_task(trace_id, node.id, context, retry,
-                           workflow=spec.name, delay=JOIN_POLL_SECONDS)
+            _new_task(spec, trace_id, node.id, context, retry, delay=JOIN_POLL_SECONDS)
             db.log_event(trace_id, "INFO",
                          f"⏳ [{node.id}] 并行分支尚未全部完成，{JOIN_POLL_SECONDS}s 后再检查")
             return
@@ -200,10 +232,11 @@ def _execute(node, trace_id, context, retry):
                              f"🔧 [{_agent.name}] {name}({_args_hint(args)}) "
                              f"-> {_short(observation, 180)}")
 
-        text = ask_agent_spec(
-            agent, prompt_ctx, ctx=ctx, on_tool=on_tool,
-            on_usage=lambda u: _record_usage(trace_id, agent, u),
-        )
+        with _LLM_SEM:      # 多 Worker 时限制同时在跑的 LLM 节点数，防 429
+            text = ask_agent_spec(
+                agent, prompt_ctx, ctx=ctx, on_tool=on_tool,
+                on_usage=lambda u: _record_usage(trace_id, agent, u),
+            )
         return True, text, text
 
     if node.type == "tool":
@@ -289,7 +322,7 @@ def _advance(spec, node, trace_id, task_id, ok, output, report, retry):
             db.log_event(trace_id, "ERROR", f"❌ [{node.id}] 路由到 failed")
             return
         db.log_event(trace_id, "INFO", f"🧠 [{node.id}] 判定 -> {target}")
-        db.create_task(trace_id, target, output, retry, workflow=spec.name)
+        _new_task(spec, trace_id, target, output, retry)
         return
 
     # 2) 顺序 / 循环回边 / 预算兜底 / 并行扇出
@@ -309,7 +342,7 @@ def _advance(spec, node, trace_id, task_id, ok, output, report, retry):
                          f"🛑 工作流 [{spec.name}] 终止：节点 [{node.id}] 失败且无兜底")
         return
     for target in real:
-        db.create_task(trace_id, target, output, next_retry, workflow=spec.name)
+        _new_task(spec, trace_id, target, output, next_retry)
 
 
 def _record_usage(trace_id, agent, usage):
@@ -368,3 +401,57 @@ def _short(text, n=300):
     """压缩日志可读性：单行 + 截断"""
     text = (text or "").strip().replace("\n", " ⏎ ")
     return text[:n] + ("…" if len(text) > n else "")
+
+
+# ---------------------------------------------------------------- 调度：任务画像
+# 编排层决定"下一步是谁"，调度层决定"什么时候、交给谁"。这里把节点的语义
+# 翻译成调度器需要的两样东西：能力标签（谁能跑）与基础优先级（谁先跑）。
+
+def _capability(node) -> str:
+    """节点 -> 能力标签，用于 Worker 能力匹配。
+
+    llm:<agent> 只有加载了该 Agent 的 Worker 会认领（Agent 定义决定模型与工具）；
+    tool:<tool> / join / human 同理。
+    """
+    if node.type == "llm":
+        return f"llm:{node.agent or 'any'}"
+    if node.type == "tool":
+        return f"tool:{node.tool or 'any'}"
+    return node.type
+
+
+def _priority(node) -> int:
+    """节点 -> 基础优先级：越"卡住整条流程"的节点越先跑。
+
+    human  100  人工已介入的 trace 要立刻推进
+    fixer   60  修复决定这条 trace 能不能救回来
+    verify  50  验收决定成败
+    coder   30  生成
+    router  20  分诊
+    join    10  轮询型任务，别占着调度位
+    """
+    if node.type == "join":
+        return 10
+    if node.type == "human":
+        return 100
+    if node.type == "tool":
+        return 50
+    agent = (node.agent or "").lower()
+    if agent.startswith("fixer"):
+        return 60
+    if agent.startswith("coder"):
+        return 30
+    return 20
+
+
+def _new_task(spec, trace_id, node_id, context, retry, *, delay=0, priority_boost=0):
+    """统一建任务入口：先把节点语义翻译成能力标签与优先级，再交给黑板。"""
+    node = spec.nodes.get(node_id)
+    if node is None:
+        # 目标节点不在定义里（YAML 写坏）：照旧下发，认领时会报"未定义节点"
+        return db.create_task(trace_id, node_id, context, retry,
+                              workflow=spec.name, delay=delay)
+    return db.create_task(trace_id, node_id, context, retry, workflow=spec.name,
+                          capability=_capability(node),
+                          priority=_priority(node) + priority_boost,
+                          delay=delay)

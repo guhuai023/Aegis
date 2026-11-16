@@ -8,7 +8,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 DB_PATH = str(BASE_DIR / "aegis_platform.db")
 
 # running 卡死回收阈值等参数集中在 core/config.py
-from core.config import STALE_SECONDS
+from core.config import AGING_MAX, AGING_STEP, STALE_SECONDS
 
 # 僵尸任务最多自动续跑几次后判定为真失败
 MAX_RECOVERY = 3
@@ -47,6 +47,8 @@ def init_db():
         ("workflow", "ALTER TABLE tasks ADD COLUMN workflow TEXT"),          # 该任务属于哪个工作流
         ("priority", "ALTER TABLE tasks ADD COLUMN priority INTEGER DEFAULT 0"),  # 调度优先级
         ("ready_at", "ALTER TABLE tasks ADD COLUMN ready_at TEXT"),          # 最早可执行时间（join 轮询用）
+        ("capability", "ALTER TABLE tasks ADD COLUMN capability TEXT"),      # 能力标签：谁能跑这个任务
+        ("created_at", "ALTER TABLE tasks ADD COLUMN created_at TEXT"),      # 入队时间（优先级老化用）
     ):
         try:
             c.execute(ddl)
@@ -66,45 +68,68 @@ def log_event(trace_id, level, message):
 
 
 def create_task(trace_id, node_id, context="", retry_count=0, workflow=None,
-                priority=0, delay=0):
+                priority=0, delay=0, capability=None):
     """把任务放上黑板（pending）。
 
-    workflow  该任务所属工作流名（引擎据此取节点定义）
-    priority  数值大的先执行（默认 0，等价于 FIFO）
-    delay     延迟多少秒之后才可被认领（join 汇合等场景）
+    workflow    该任务所属工作流名（引擎据此取节点定义）
+    priority    基础优先级，数值大的先执行（引擎按节点语义给：人工恢复 100 / 修复 60 / 验收 50 …）
+    delay       延迟多少秒之后才可被认领（join 汇合等场景）
+    capability  能力标签（llm:fixer / tool:execute_spec / join / human），
+                调度器据此把任务只派给会跑的 Worker；None 表示谁都能跑
     """
     task_id = str(uuid.uuid4())[:8]
-    ready_at = (datetime.now() + timedelta(seconds=delay)).strftime("%Y-%m-%d %H:%M:%S") if delay else None
+    now = datetime.now()
+    ready_at = (now + timedelta(seconds=delay)).strftime("%Y-%m-%d %H:%M:%S") if delay else None
     conn = get_conn()
     conn.execute(
         "INSERT INTO tasks (task_id, trace_id, node_id, status, input_context, "
-        "retry_count, workflow, priority, ready_at) VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?)",
-        (task_id, trace_id, node_id, context, retry_count, workflow, priority, ready_at))
+        "retry_count, workflow, priority, ready_at, capability, created_at) "
+        "VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?)",
+        (task_id, trace_id, node_id, context, retry_count, workflow, priority,
+         ready_at, capability, now.strftime("%Y-%m-%d %H:%M:%S")))
     conn.commit()
     conn.close()
     log_event(trace_id, "INFO", f"📝 节点 [{node_id}] 已加入任务黑板")
     return task_id
 
 
-def claim_task():
+def claim_task(capabilities=None):
     """原子认领一个可执行任务并置为 running。
 
     BEGIN IMMEDIATE 立即获取写锁：多个 Worker / 多个浏览器会话同时认领时
     在数据库层串行化，杜绝"先 SELECT 再 UPDATE"两步之间被抢走的重复消费。
-    排序规则：priority 高的先跑，同优先级按入队顺序（FIFO）。
+
+    派工规则（三道）：
+      1. 能力匹配：只派给会跑这个任务的 Worker（capability 为 NULL 表示不限人手）
+      2. 动态优先级：有效优先级 = 基础优先级 + 老化加成；
+         等得越久加成越高，最多 AGING_MAX，防止低优先级任务被永久饿死
+      3. 同一时刻按入队顺序 FIFO，保证同优先级公平
     """
+    caps = [str(c) for c in (capabilities or []) if c]
+    now = _now()
+
+    where = ["status='pending'", "(ready_at IS NULL OR ready_at <= ?)"]
+    params = [now]
+    if caps:
+        where.append("(capability IS NULL OR capability IN (%s))" % ",".join("?" * len(caps)))
+        params.extend(caps)
+
+    aging = ("MIN(?, MAX(0, CAST((julianday(?) - julianday(COALESCE(created_at, ?)))"
+             " * 86400 / ? AS INTEGER)))")
+    sql = ("SELECT task_id, trace_id, node_id, input_context, retry_count, workflow "
+           "FROM tasks WHERE " + " AND ".join(where)
+           + " ORDER BY (COALESCE(priority, 0) + " + aging + ") DESC, rowid LIMIT 1")
+    params.extend([AGING_MAX, now, now, AGING_STEP])
+
     conn = get_conn()
     try:
         conn.execute("BEGIN IMMEDIATE")
-        row = conn.execute(
-            "SELECT task_id, trace_id, node_id, input_context, retry_count, workflow "
-            "FROM tasks WHERE status='pending' AND (ready_at IS NULL OR ready_at <= ?) "
-            "ORDER BY priority DESC, rowid LIMIT 1", (_now(),)).fetchone()
+        row = conn.execute(sql, params).fetchone()
         if row is None:
             conn.rollback()
             return None
         conn.execute("UPDATE tasks SET status='running', started_at=? WHERE task_id=?",
-                     (_now(), row[0]))
+                     (now, row[0]))
         conn.commit()
         return row
     except Exception:
@@ -112,6 +137,31 @@ def claim_task():
         raise
     finally:
         conn.close()
+
+
+def scheduler_snapshot():
+    """调度器观测快照：待执行任务按能力分类的积压与最长等待（前端「调度器」卡用）。"""
+    now = _now()
+    conn = get_conn()
+    try:
+        running = conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE status='running'").fetchone()[0]
+        rows = conn.execute(
+            "SELECT COALESCE(capability, '(不限)') AS cap, COUNT(*) AS n, "
+            "  MAX(COALESCE(priority, 0)) AS top, "
+            "  CAST((julianday(?) - julianday(MIN(COALESCE(created_at, ?)))) * 86400 AS INTEGER) AS wait_s "
+            "FROM tasks WHERE status='pending' GROUP BY cap ORDER BY n DESC",
+            (now, now)).fetchall()
+    finally:
+        conn.close()
+    return {
+        "running": int(running or 0),
+        "buckets": [
+            {"capability": r[0], "pending": int(r[1]), "top_priority": int(r[2] or 0),
+             "wait_s": int(r[3] or 0)}
+            for r in rows
+        ],
+    }
 
 
 def finish_task(task_id, status, output=None):

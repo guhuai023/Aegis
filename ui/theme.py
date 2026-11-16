@@ -382,6 +382,43 @@ def var_list(pairs):
     return f'<div class="ag-panel">{"".join(rows)}</div>'
 
 
+def worker_list(items):
+    """调度器：Worker 画像。items: [(worker 名, 能力集, 认领数)]"""
+    if not items:
+        return ('<div class="ag-panel"><div class="ag-note" style="padding:10px 12px">'
+                "引擎尚未启动 Worker</div></div>")
+    rows = []
+    for name, caps, claimed in items:
+        cap_txt = "全能力" if list(caps) == ["*"] else " ".join(caps)
+        rows.append(
+            '<div class="ag-row"><span><span class="id">%s</span>'
+            '<span class="sub">%s</span></span>'
+            '<span style="font-size:11px;color:#667085">本进程认领 %s</span></div>'
+            % (esc(name), esc(cap_txt), esc(claimed))
+        )
+    return '<div class="ag-panel">%s</div>' % "".join(rows)
+
+
+def sched_table(buckets):
+    """调度器：待执行任务按能力分类。buckets: [{capability, pending, top_priority, wait_s}]"""
+    if not buckets:
+        return ('<div class="ag-panel"><div class="ag-note" style="padding:10px 12px">'
+                "当前没有待执行任务</div></div>")
+    rows = []
+    for b in buckets:
+        rows.append(
+            '<tr><td class="id">%s</td><td class="num">%s</td>'
+            '<td class="num">%s</td><td class="num">%ss</td></tr>'
+            % (esc(b["capability"]), esc(b["pending"]),
+               esc(b["top_priority"]), esc(b["wait_s"]))
+        )
+    return ('<div class="ag-panel"><table class="ag-tbl">'
+            '<thead><tr><th>能力</th><th style="text-align:right">积压</th>'
+            '<th style="text-align:right">优先级</th>'
+            '<th style="text-align:right">最长等待</th></tr></thead>'
+            '<tbody>%s</tbody></table></div>' % "".join(rows))
+
+
 def file_rows(files, sizes):
     if not files:
         return ('<div class="ag-panel"><div class="ag-note" style="padding:10px 12px">'

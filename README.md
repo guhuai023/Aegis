@@ -173,7 +173,27 @@ Agent 工具走标准 Function Calling：模型返回 `tool_calls` → 引擎在
 
 ---
 
-## 7. 可靠性加固（都是实际踩过的坑）
+## 7. 调度器（能力匹配 + 动态优先级）
+
+编排层决定"下一步是谁"，调度层决定"什么时候、交给谁"。派工要过三道闸：
+
+| 闸门 | 做法 |
+|---|---|
+| **能力匹配** | 节点语义派生成能力标签：`llm:<agent>` / `tool:<tool>` / `join` / `human`。Worker 只认领自己会跑的任务（`capability` 为 `NULL` 表示不限人手） |
+| **动态优先级** | 基础优先级来自节点语义：`human 100`、`fixer 60`、`verify 50`、`coder 30`、`router 20`、`join 10`；人工介入恢复的任务再 `+100` |
+| **老化防饿死** | 有效优先级 = 基础优先级 + 老化加成（每等 15 秒 +1，最多 +20），低优先级任务不会被永久压死 |
+
+三条规则在**同一条 SQL** 内完成过滤、排序与认领，仍然包在 `BEGIN IMMEDIATE` 里，多 Worker 并发不会重复消费。
+
+- **Worker 能力分区**：`start_engine(workers=2, capabilities=[{"llm:coder","llm:router"}, {"tool:execute_spec","join"}])`
+- **LLM 并发闸门**：`_LLM_SEM` 限制同时在跑的 llm 节点数（默认 2），多 Worker 时不会把 provider 打爆
+- **可观测**：`db.scheduler_snapshot()` 给出各能力的积压与最长等待，`engine.WORKER_STATE` 给出每个 Worker 的认领数，控制台「调度器」卡直接展示
+
+一次真实派工（`parallel_demo`，默认单 Worker）会看到：`split` 之后两条分支都被下发到黑板，`merge` 以低优先级延迟轮询等分支齐活，`summarize` 收尾；日志里每次认领都能对上。把 `WORKER_COUNT` 调大或给能力分区，就是多 Worker 并行。
+
+---
+
+## 8. 可靠性加固（都是实际踩过的坑）
 
 | 隐患 | 加固 |
 |---|---|
@@ -186,7 +206,7 @@ Agent 工具走标准 Function Calling：模型返回 `tool_calls` → 引擎在
 
 ---
 
-## 8. 已知限制
+## 9. 已知限制
 
 诚实声明，以下能力**尚未实现**，不要当成已有功能：
 
@@ -198,6 +218,6 @@ Agent 工具走标准 Function Calling：模型返回 `tool_calls` → 引擎在
 
 ---
 
-## 9. 文档
+## 10. 文档
 
 - [编排引擎改造说明](docs/编排引擎改造说明.md)：改造前后对照、字段参考、等价性与迁移证据。
