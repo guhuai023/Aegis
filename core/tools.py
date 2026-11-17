@@ -3,6 +3,7 @@
 安全说明：生成的代码仍以当前用户权限运行（不是隔离沙箱）。
 生产环境请改用 Docker / 受限进程执行不可信代码。
 """
+import contextvars
 import hashlib
 import json
 import os
@@ -13,6 +14,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from core.config import SANDBOX_TIMEOUT, INSTALL_TIMEOUT, WORKSPACES_DIR
+
+# 当前正在执行哪个节点（引擎设置，用来把产物归属到节点上）
+_RUN_NODE: contextvars.ContextVar = contextvars.ContextVar("aegis_run_node", default=None)
 
 SEC_REQUIREMENTS = "=== REQUIREMENTS ==="
 SEC_ASSERTIONS = "=== ASSERTIONS ==="
@@ -109,16 +113,75 @@ def _cleanup_manifest_files(ws: Path, manifest_name):
         pass
 
 
-def prepare_workspace(trace_id, files):
-    """把规格里的文件写入工作区。
+_MANIFEST = ".aegis_nodes.json"
 
-    先清掉上一轮的规格文件和运行产物（跨轮隔离：FILE_EXISTS 等产物断言
-    只认本轮真实生成的文件，不会被上一轮遗留物骗过），再写入本轮文件。
-    返回 (ws, written, skipped)
+
+def _load_manifests(ws: Path) -> dict:
+    path = ws / _MANIFEST
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _save_manifests(ws: Path, data: dict) -> None:
+    try:
+        (ws / _MANIFEST).write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _current_node():
+    """当前正在执行的节点 id（由引擎通过 run_as_node 设置），没有则 None。"""
+    ctx = _RUN_NODE.get()
+    return ctx[0] if ctx else None
+
+
+def run_as_node(node_id):
+    """引擎在调用 tool 节点前后用它标记"这些产物算哪个节点的"。
+
+    返回 token，调用方用 reset_run_as_node 复位（contextvar，线程安全）。
+    """
+    return _RUN_NODE.set((str(node_id),))
+
+
+def reset_run_as_node(token):
+    _RUN_NODE.reset(token)
+
+
+def _clean_node_files(ws: Path, entry: dict) -> None:
+    for rel in (entry.get("spec") or []) + (entry.get("artifacts") or []):
+        p = _safe_relpath(rel, ws)
+        if p and p.is_file():
+            p.unlink()
+
+
+def prepare_workspace(trace_id, files):
+    """把规格里的文件写入工作区。返回 (ws, written, skipped)
+
+    产物隔离粒度 = **节点级**（不是轮次级）：
+      · 同一个节点重试时，清掉它自己上一轮写下的规格文件与产物
+        —— 这样 FILE_EXISTS / REGEX_FILE 只认本轮真实生成的文件，不会被上次残留骗过；
+      · 不同节点的产物跨节点保留
+        —— 数据管线需要「A 支线清洗 -> 汇合 -> B 节点合并」，不能互相清掉。
+    没有节点上下文（直接调用 / 老数据）时退回全量清理语义。
     """
     ws = get_workspace_dir(trace_id)
-    _cleanup_manifest_files(ws, ".aegis_manifest.json")   # 上一轮的规格文件
-    _cleanup_manifest_files(ws, ".aegis_artifacts.json")  # 上一轮的运行产物
+    manifests = _load_manifests(ws)
+    node_id = _current_node()
+
+    if node_id:
+        if node_id in manifests:
+            _clean_node_files(ws, manifests[node_id])
+    else:
+        _cleanup_manifest_files(ws, ".aegis_manifest.json")   # 兼容旧版清单
+        _cleanup_manifest_files(ws, ".aegis_artifacts.json")
+        for entry in manifests.values():
+            _clean_node_files(ws, entry)
+
     written, skipped = [], []
     for name, content in files.items():
         p = _safe_relpath(name, ws)
@@ -128,8 +191,31 @@ def prepare_workspace(trace_id, files):
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")
         written.append(p.relative_to(ws).as_posix())
-    (ws / ".aegis_manifest.json").write_text(json.dumps(written, ensure_ascii=False), encoding="utf-8")
+
+    if node_id:
+        manifests.setdefault(node_id, {})["spec"] = written
+        _save_manifests(ws, manifests)
+    else:
+        (ws / ".aegis_manifest.json").write_text(json.dumps(written, ensure_ascii=False), encoding="utf-8")
     return ws, written, skipped
+
+
+def _record_artifacts(ws: Path, artifacts) -> None:
+    """登记本轮新增产物，供同一节点下次重试时清理。"""
+    node_id = _current_node()
+    if not node_id:                       # 直接调用（测试/旧路径）：沿用单文件清单
+        art_path = ws / ".aegis_artifacts.json"
+        try:
+            prev = json.loads(art_path.read_text(encoding="utf-8")) if art_path.exists() else []
+        except (json.JSONDecodeError, OSError):
+            prev = []
+        art_path.write_text(json.dumps(sorted(set(prev) | set(artifacts)), ensure_ascii=False),
+                            encoding="utf-8")
+        return
+    manifests = _load_manifests(ws)
+    entry = manifests.setdefault(node_id, {})
+    entry["artifacts"] = sorted(set(entry.get("artifacts") or []) | set(artifacts))
+    _save_manifests(ws, manifests)
 
 
 def list_workspace_files(trace_id):
@@ -200,18 +286,122 @@ def ensure_venv(trace_id, requirements):
 
 # ---------------- 物理验收执行 ----------------
 
+# 断言词汇表：验收能力的边界就是平台的适用边界（能写出的断言 = 能接的场景）。
+# 新增一类断言只需要在这里登记 + 在 _check_assertion 里实现，工作流不用改。
+ASSERTION_KINDS = {
+    "CONTAINS": "输出包含该文本",
+    "NOT_CONTAINS": "输出不包含该文本",
+    "REGEX": "输出匹配该正则（按行匹配，^ $ 作用于每一行）",
+    "FILE_EXISTS": "工作区里存在该文件且非空",
+    "FILE_MIN_SIZE": "FILE_MIN_SIZE: 文件名, 字节数 —— 产物大小下限（防只有表头的空 CSV）",
+    "REGEX_FILE": "REGEX_FILE: 文件名 :: 正则 —— 直接校验收产物内容（按行匹配）",
+    "EXIT_CODE": "EXIT_CODE: 0 —— 校验进程退出码（不写这条时非 0 直接判失败）",
+    "NEAR": "NEAR: 期望值, 容差 —— 输出中任一数值落在容差内（科研/统计类任务）",
+}
+
+_ASSERT_RE = re.compile(r"^([A-Za-z_]{2,})\s*:\s*(.*)$")
+_NUM_RE = re.compile(r"-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?")
+
+
+def _parse_assertion(line):
+    """把一行断言解析成 (kind, arg)。
+
+    兼容三种写法：
+      标准   CONTAINS: 9
+      拼错   CONTANIS: 9      -> ("INVALID", ...) 明确判失败，不静默降级成 CONTAINS
+      旧写法 总金额: 100       -> 中文标签按 CONTAINS 整行匹配（向后兼容）
+    """
+    text = (line or "").strip()
+    m = _ASSERT_RE.match(text)
+    if not m:
+        return "CONTAINS", text
+    kind, arg = m.group(1).upper(), m.group(2).strip()
+    if kind in ASSERTION_KINDS:
+        return kind, arg
+    if re.fullmatch(r"[A-Z][A-Z_]+", m.group(1)):
+        return "INVALID", text
+    return "CONTAINS", text
+
+
+def _check_assertion(kind, arg, stdout, ws, returncode):
+    """校验单条断言，返回 (是否通过, 失败细节)。"""
+    if kind == "CONTAINS":
+        return arg in stdout, None
+    if kind == "NOT_CONTAINS":
+        return arg not in stdout, None
+    if kind == "REGEX":
+        try:
+            # 按行匹配：文本/CSV 场景里 ^ $ 想表达的几乎总是"某一行"
+            return bool(re.search(arg, stdout, re.MULTILINE)), None
+        except re.error as e:
+            return False, f"正则非法: {e}"
+    if kind == "FILE_EXISTS":
+        fp = _safe_relpath(arg, ws)
+        return bool(fp and fp.is_file() and fp.stat().st_size > 0), None
+    if kind == "FILE_MIN_SIZE":
+        name, _, size = arg.partition(",")
+        try:
+            need = int(size.strip())
+        except ValueError:
+            return False, "格式应为 FILE_MIN_SIZE: 文件名, 字节数"
+        fp = _safe_relpath(name.strip(), ws)
+        if not (fp and fp.is_file()):
+            return False, f"文件不存在: {name.strip()}"
+        got = fp.stat().st_size
+        return got >= need, (f"实际 {got} B < 要求 {need} B" if got < need else None)
+    if kind == "REGEX_FILE":
+        name, sep, pattern = arg.partition("::")
+        if not sep:
+            return False, "格式应为 REGEX_FILE: 文件名 :: 正则"
+        fp = _safe_relpath(name.strip(), ws)
+        if not (fp and fp.is_file()):
+            return False, f"文件不存在: {name.strip()}"
+        try:
+            content = fp.read_text(encoding="utf-8", errors="replace")
+        except OSError as e:
+            return False, f"读取失败: {e}"
+        try:
+            return bool(re.search(pattern.strip(), content, re.MULTILINE)), None
+        except re.error as e:
+            return False, f"正则非法: {e}"
+    if kind == "EXIT_CODE":
+        try:
+            want = int(arg)
+        except ValueError:
+            return False, "格式应为 EXIT_CODE: 0"
+        return returncode == want, (f"实际退出码 {returncode}" if returncode != want else None)
+    if kind == "NEAR":
+        want_s, _, tol_s = arg.partition(",")
+        try:
+            want = float(want_s.strip())
+            tol = abs(float(tol_s.strip())) if tol_s.strip() else 1e-6
+        except ValueError:
+            return False, "格式应为 NEAR: 期望值, 容差"
+        nums = [float(x) for x in _NUM_RE.findall(stdout)]
+        if any(abs(n - want) <= tol for n in nums):
+            return True, None
+        if not nums:
+            return False, f"输出里没有数值，期望 {want}±{tol}"
+        nearest = min(nums, key=lambda n: abs(n - want))
+        return False, f"没有任何数值落在 {want}±{tol}，最接近的是 {nearest}"
+    if kind == "INVALID":
+        return False, "未知断言类型（拼写错误？可用: " + ", ".join(sorted(ASSERTION_KINDS)) + "）"
+    return False, f"未知断言类型: {kind}"
+
+
 def run_workspace(trace_id, assertions, timeout=None):
     """在工作区执行 main.py 并做断言式验收，返回 (ok, report, stdout)。
 
-    断言格式：CONTAINS: 文本 / NOT_CONTAINS: 文本 / REGEX: 正则（每行一条）。
+    断言每行一条，类型见 ASSERTION_KINDS。
     无断言时退回默认验收：退出码 0 且产生非空输出。
+    只有显式写了 EXIT_CODE 断言，非 0 退出才不直接判失败。
     """
     ws = WORKSPACES_DIR / trace_id
     if not (ws / "main.py").exists():
         return False, "入口文件 main.py 不存在", ""
     timeout = timeout or SANDBOX_TIMEOUT
     vpy = _venv_python(ws)
-    py = str(vpy) if vpy.exists() else "python"
+    py = str(vpy) if vpy.exists() else sys.executable   # 没有 venv 就用当前解释器，避免依赖 PATH 上的 python
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUTF8"] = "1"
@@ -226,7 +416,10 @@ def run_workspace(trace_id, assertions, timeout=None):
     except Exception as e:
         return False, f"执行异常: {e}", ""
 
-    if r.returncode != 0:
+    parsed = [_parse_assertion(line) for line in (assertions or [])]
+    has_exit_assert = any(kind == "EXIT_CODE" for kind, _ in parsed)
+
+    if r.returncode != 0 and not has_exit_assert:
         return False, (f"程序异常退出（退出码 {r.returncode}）:\n"
                        f"{(r.stderr or r.stdout or '')[-1000:]}"), r.stdout
 
@@ -236,28 +429,18 @@ def run_workspace(trace_id, assertions, timeout=None):
             return True, "验收通过：程序正常退出且产生输出", stdout
         return False, "验收不通过：程序退出码为 0，但没有任何输出（可能只定义了函数未调用）", stdout
 
-    fails, passes = [], 0
-    for line in assertions:
-        m = re.match(r"^(CONTAINS|NOT_CONTAINS|REGEX|FILE_EXISTS)\s*:\s*(.*)$", line, re.I)
-        kind, arg = (m.group(1).upper(), m.group(2)) if m else ("CONTAINS", line)
-        if kind == "CONTAINS":
-            good = arg in stdout
-        elif kind == "NOT_CONTAINS":
-            good = arg not in stdout
-        elif kind == "FILE_EXISTS":
-            # 产物断言：文件必须存在于工作区且非空（CSV/JSON/图片等交付物）
-            fp = _safe_relpath(arg, ws)
-            good = bool(fp and fp.is_file() and fp.stat().st_size > 0)
+    fails, kinds_hit = [], {}
+    for kind, arg in parsed:
+        ok, detail = _check_assertion(kind, arg, stdout, ws, r.returncode)
+        if ok:
+            kinds_hit[kind] = kinds_hit.get(kind, 0) + 1
         else:
-            good = bool(re.search(arg, stdout))
-        if good:
-            passes += 1
-        else:
-            fails.append(line)
+            fails.append(f"{kind}: {arg}" + (f"（{detail}）" if detail else ""))
     if not fails:
-        return True, f"验收通过：{len(assertions)} 条断言全部满足", stdout
-    return False, ("验收不通过，失败断言:\n" + "\n".join(f"  ✗ {f}" for f in fails)
-                   + f"\n实际输出（前 800 字）:\n{stdout[:800]}"), stdout
+        breakdown = "，".join(f"{k}×{v}" for k, v in sorted(kinds_hit.items()))
+        return True, f"验收通过：{len(parsed)} 条断言全部满足（{breakdown}）", stdout
+    tail = f"\n实际输出（前 800 字）:\n{stdout[:800]}" if stdout.strip() else "\n（程序没有任何输出）"
+    return False, ("验收不通过，失败断言:\n" + "\n".join(f"  ✗ {f}" for f in fails) + tail), stdout
 
 
 def execute_spec(trace_id, spec_text):
@@ -280,15 +463,10 @@ def execute_spec(trace_id, spec_text):
 
     before = set(list_workspace_files(trace_id))
     ok, report, stdout = run_workspace(trace_id, spec.assertions)
-    # 运行期间新产生的文件 = 本轮任务产物（CSV/JSON/图片等）。
-    # 产物清单累积登记（含历史轮次），保证下一轮 prepare_workspace 能全部清干净
+    # 运行期间新产生的文件 = 本轮任务产物（CSV/JSON/图片等），按节点登记，
+    # 同一节点重试时只清自己的产物，不同节点的产物跨节点保留（数据管线要靠它传文件）
     artifacts = sorted(f for f in list_workspace_files(trace_id) if f not in before)
-    art_path = ws / ".aegis_artifacts.json"
-    try:
-        prev = json.loads(art_path.read_text(encoding="utf-8")) if art_path.exists() else []
-    except (json.JSONDecodeError, OSError):
-        prev = []
-    art_path.write_text(json.dumps(sorted(set(prev) | set(artifacts)), ensure_ascii=False), encoding="utf-8")
+    _record_artifacts(ws, artifacts)
     if artifacts:
         sizes = ", ".join(f"{a}({_fmt_size((WORKSPACES_DIR / trace_id / a).stat().st_size)})"
                           for a in artifacts)

@@ -22,7 +22,7 @@ import traceback
 import uuid
 
 from core import db
-from core.agents import ask_agent_spec, get_agent
+from core.agents import AgentError, ask_agent_spec, get_agent, reload_agents
 from core.config import (
     DEFAULT_WORKFLOW, JOIN_POLL_SECONDS, MAX_FILE_CHARS_IN_CONTEXT,
     MAX_FILES_IN_CONTEXT, MAX_LLM_CONCURRENCY, MAX_STEPS_PER_TRACE,
@@ -30,6 +30,7 @@ from core.config import (
 )
 from core.tools import (
     TOOL_REGISTRY, ToolContext, get_workspace_dir, list_workspace_files,
+    reset_run_as_node, run_as_node,
 )
 from core.workflow import (
     TERMINAL, WorkflowError, WorkflowSpec, load_workflow,
@@ -40,6 +41,21 @@ _ENGINE_STARTED = False
 
 # 同时在跑的 LLM 节点上限：多 Worker 时把并发压在这里，避免把 provider 打爆（429）
 _LLM_SEM = threading.Semaphore(max(1, int(MAX_LLM_CONCURRENCY)))
+
+# 同一个 trace 的落盘/执行阶段必须串行：
+# 工作区是按 trace 共享的，而 execute_spec 固定入口是 main.py，
+# 并行支线同时跑沙箱会互相覆盖入口文件。LLM 调用仍然并行，只有"写+跑+验"这段加锁。
+_TOOL_LOCKS: dict[str, threading.Lock] = {}
+_TOOL_LOCKS_GUARD = threading.Lock()
+
+
+def _trace_tool_lock(trace_id: str) -> threading.Lock:
+    with _TOOL_LOCKS_GUARD:
+        if len(_TOOL_LOCKS) > 256:            # 简单上限，避免长跑进程无限增长
+            for key in list(_TOOL_LOCKS)[:128]:
+                if key != trace_id and not _TOOL_LOCKS[key].locked():
+                    _TOOL_LOCKS.pop(key, None)
+        return _TOOL_LOCKS.setdefault(trace_id, threading.Lock())
 
 # Worker 运行时画像（认领数 / 当前任务 / 能力集），前端「调度器」卡展示用
 WORKER_STATE: dict[str, dict] = {}
@@ -220,7 +236,13 @@ def _execute(node, trace_id, context, retry):
         return True, "", "等待人工介入"
 
     if node.type == "llm":
-        agent = get_agent(node.agent)
+        # Agent 热加载：新增/修改 agents/*.yaml 后不需要重启引擎（与工作流 mtime 热加载对齐）。
+        # 只有解析不到时才重扫一次，正常路径零额外开销。
+        try:
+            agent = get_agent(node.agent)
+        except AgentError:
+            reload_agents()
+            agent = get_agent(node.agent)
         # 只有 YAML 里声明了 tools 的 Agent 才挂工具上下文（省的给每个 trace 建空目录）
         ctx = None
         on_tool = None
@@ -243,7 +265,14 @@ def _execute(node, trace_id, context, retry):
         fn = TOOL_REGISTRY.get(node.tool or "")
         if fn is None:
             return False, "", f"未注册的工具: {node.tool}（可用: {', '.join(TOOL_REGISTRY)}）"
-        result = fn(trace_id, prompt_ctx)
+        # 标记"这些产物算哪个节点的"：同一节点重试只清自己的产物，跨节点保留
+        # 同 trace 内串行执行：防止并行支线同时覆盖同一个入口文件
+        with _trace_tool_lock(trace_id):
+            token = run_as_node(node.id)
+            try:
+                result = fn(trace_id, prompt_ctx)
+            finally:
+                reset_run_as_node(token)
         return bool(result.ok), (result.report or ""), (result.report or "")
 
     return False, "", f"未知节点类型: {node.type}"

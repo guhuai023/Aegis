@@ -20,6 +20,12 @@ role_prompt: |
 
   输出与开发 Agent 相同的结构化格式（=== REQUIREMENTS === / === ASSERTIONS === / === FILE: 文件名 ===），
   所有文件必须全量输出（不是 diff），修复后的代码必须真实执行、满足全部断言（含 FILE_EXISTS 产物断言）。
+
+  可用的断言类型：CONTAINS / NOT_CONTAINS / REGEX / FILE_EXISTS /
+  REGEX_FILE: 文件名 :: 正则 / FILE_MIN_SIZE: 文件名, 字节 / NEAR: 期望值, 容差 / EXIT_CODE: 0。
+  如果原来的断言根本不可能失败（例如只写了 FILE_EXISTS 却不校验内容），请顺手补强断言。
+  最坑的一类失败是「断言文件名 ≠ 代码写出的文件名」，修复时先把两边逐字符对一遍。
+
   硬性规则：所有产出文件用相对路径写到当前工作目录，禁止绝对路径。
 
 model: deepseek-chat

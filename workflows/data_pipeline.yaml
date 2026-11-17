@@ -1,0 +1,118 @@
+# Aegis 工作流定义：数据 / 报表产线（第二条行业线）
+#
+# 与 code_gen 的对比是本文件最想表达的东西：**同一个引擎，失败策略相反**。
+#    code_gen       验收失败 -> 自动修复回边（最多 2 次）-> 熔断转人工
+#   data_pipeline  验收失败 -> 直接终止（数据口径错误自动改写，风险高于收益）
+# 策略差异全部写在 YAML 里，引擎一行都不用改 —— 这就是"流程是数据"的意义。
+#
+# 用到的控制结构：
+#   并行扇出   intake 成功后 parallel: [branch_a, branch_b]
+#   汇合等待   gather: type=join, join=[verify_a, verify_b]
+#   多段产物   A/B 支线各自清洗 -> 汇合后由 merge 节点读两份产物做合并
+#              （依赖 core/tools.py 的节点级产物隔离：不同节点的产物跨节点保留）
+name: data_pipeline
+version: 1
+description: >-
+  数据/报表产线：一句话需求 -> 分析 Agent 拆成两条并行支线 -> 各自生成并清洗数据 ->
+  汇合 -> 合并成一份交付报表。验收失败不自动改写，直接终止（数据错误宁可暴露）。
+entry: intake
+
+nodes:
+  # ---------------- 需求拆解（扇出点） ----------------
+  - id: intake
+    type: llm
+    label: 需求拆解
+    agent: analyst
+    context: "{prompt}"
+    publish: plan
+    parallel: [branch_a, branch_b]   # 两条支线并发执行，互不依赖
+
+  # ---------------- 支线 A ----------------
+  - id: branch_a
+    type: llm
+    label: 支线A 生成+清洗
+    agent: coder
+    context: |
+      原始需求：
+      {prompt}
+
+      分析结论（你只负责支线A）：
+      {plan}
+
+      你只写支线A 的脚本：生成它需要的数据、完成清洗，产出 A 支线约定的文件。
+      不要做合并、不要写 B 支线的文件。
+      断言至少包含：FILE_EXISTS 产物、REGEX_FILE 校验列名、NOT_CONTAINS: Traceback。
+    publish: spec_a
+    next: verify_a
+
+  # ---------------- 支线 B ----------------
+  - id: branch_b
+    type: llm
+    label: 支线B 生成+清洗
+    agent: coder
+    context: |
+      原始需求：
+      {prompt}
+
+      分析结论（你只负责支线B）：
+      {plan}
+
+      你只写支线B 的脚本：生成它需要的数据、完成清洗，产出 B 支线约定的文件。
+      不要做合并、不要写 A 支线的文件。
+      断言至少包含：FILE_EXISTS 产物、REGEX_FILE 校验列名、NOT_CONTAINS: Traceback。
+    publish: spec_b
+    next: verify_b
+
+  # ---------------- 两条支线各自验收 ----------------
+  - id: verify_a
+    type: tool
+    label: 支线A 验收
+    tool: execute_spec
+    context: "{spec_a}"
+    on_success: gather
+    on_failure: failed        # 刻意不自动修：数据错误直接暴露给发起人
+
+  - id: verify_b
+    type: tool
+    label: 支线B 验收
+    tool: execute_spec
+    context: "{spec_b}"
+    on_success: gather
+    on_failure: failed
+
+  # ---------------- 汇合 ----------------
+  - id: gather
+    type: join
+    label: 支线汇合
+    join: [verify_a, verify_b]
+    wait_timeout: 120
+    next: merge
+
+  # ---------------- 合并（读上游两份产物） ----------------
+  - id: merge
+    type: llm
+    label: 合并报表
+    agent: coder
+    context: |
+      原始需求：
+      {prompt}
+
+      合并口径：
+      {plan}
+
+      两条支线的产物已经在当前工作目录里，直接用相对路径读取它们（不要重新生成数据）。
+      写合并脚本，产出最终交付文件，并打印关键汇总值（如总金额）。
+      断言至少包含：FILE_EXISTS 最终交付文件、REGEX_FILE 校验表头、CONTAINS 汇总值。
+      注意：**总额这类运行时才知道的数字，断言用格式匹配**（如 REGEX: 总金额: \d+\.\d{2}），
+      不要写死一个猜出来的精确值——猜错就会被自己的断言判失败。
+      打印格式要与断言逐字符对齐（小数点位数、冒号、空格都要一致）。
+    publish: spec_merge
+    next: verify_merge
+
+  - id: verify_merge
+    type: tool
+    label: 合并验收
+    tool: execute_spec
+    context: "{spec_merge}"
+    on_success: done
+    on_failure: failed
