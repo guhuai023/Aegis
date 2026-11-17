@@ -482,3 +482,90 @@ def to_mermaid(spec: WorkflowSpec, states: dict | None = None) -> str:
         "    classDef pending fill:#E0E0E0,color:#000",
     ]
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------- 序列化与保存（可视化编辑器用）
+# 编辑器的"所见即所得"必须落回同一份 YAML：界面改完 -> spec_to_dict -> 校验 -> 原子写盘，
+# 引擎下一次认领就能读到新定义（带 mtime 缓存，无需重启）。
+
+_SIMPLE_EDGES = ("next", "on_success", "on_failure", "on_exhausted", "on_resume")
+
+
+def spec_to_dict(spec: WorkflowSpec) -> dict:
+    """WorkflowSpec -> YAML 同构 dict。只写非默认值，生成的 YAML 保持可读。"""
+    nodes = []
+    for node in spec.nodes.values():
+        item: dict = {"id": node.id, "type": node.type}
+        if node.label:
+            item["label"] = node.label
+        if node.agent:
+            item["agent"] = node.agent
+        if node.tool:
+            item["tool"] = node.tool
+        if node.context and node.context != "{prompt}":
+            item["context"] = node.context
+        if node.publish:
+            item["publish"] = node.publish
+        if node.routes:
+            item["routes"] = dict(node.routes)
+        for key in _SIMPLE_EDGES:
+            value = getattr(node, key)
+            if value:
+                item[key] = value
+        if node.max_retries is not None:
+            item["max_retries"] = node.max_retries
+        if node.parallel:
+            item["parallel"] = list(node.parallel)
+        if node.join:
+            item["join"] = list(node.join)
+        if node.type == "join" and node.wait_timeout != 60:
+            item["wait_timeout"] = node.wait_timeout
+        if node.sub_workflow:
+            item["sub_workflow"] = node.sub_workflow
+        nodes.append(item)
+
+    data: dict = {"name": spec.name}
+    if spec.description:
+        data["description"] = spec.description
+    data["version"] = spec.version
+    data["entry"] = spec.entry
+    data["nodes"] = nodes
+    return data
+
+
+def spec_to_yaml(spec: WorkflowSpec) -> str:
+    """序列化成 YAML 文本（中文不转义，字段顺序固定）。"""
+    return yaml.safe_dump(spec_to_dict(spec), allow_unicode=True,
+                          sort_keys=False, width=100, default_flow_style=False)
+
+
+def validate_data(data: dict, name: str | None = None) -> WorkflowSpec:
+    """不落盘地校验一份定义（编辑器「校验」按钮用）；不合法直接抛 WorkflowError。"""
+    label = name or str((data or {}).get("name") or "draft")
+    spec = _build(data or {}, WORKFLOWS_DIR / f"{label}.yaml")
+    _validate(spec)
+    return spec
+
+
+def save_workflow_data(name: str, data: dict) -> Path:
+    """校验通过才写盘，且用临时文件 + replace 保证不会留下半截 YAML。"""
+    spec = validate_data(data, name)
+    path = WORKFLOWS_DIR / f"{name}.yaml"
+    text = spec_to_yaml(spec)
+    tmp = path.with_suffix(".yaml.tmp")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(path)
+    _CACHE.pop(path, None)
+    return path
+
+
+def blank_node(node_id: str, ntype: str = "llm") -> dict:
+    """新建节点的初始形状（按类型给出必填字段，避免一建出来就校验失败）。"""
+    node: dict = {"id": node_id, "type": ntype}
+    if ntype == "llm":
+        node["agent"] = "coder"
+    elif ntype == "tool":
+        node["tool"] = "execute_spec"
+    elif ntype == "join":
+        node["join"] = []
+    return node

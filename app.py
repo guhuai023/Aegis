@@ -17,9 +17,12 @@ from core.config import DEFAULT_WORKFLOW, WORKER_COUNT
 from core.engine import (
     WORKER_STATE, get_workflow, resume_with_advice, start_engine, start_workflow,
 )
-from core.tools import get_workspace_dir, list_workspace_files
-from core.workflow import WorkflowError, list_workflows, to_dot
-from ui import theme
+from core.tools import get_workspace_dir, list_tools, list_workspace_files
+from core.workflow import (
+    NODE_TYPES, WorkflowError, blank_node, list_workflows, load_workflow,
+    save_workflow_data, spec_to_dict, spec_to_yaml, to_dot, validate_data,
+)
+from ui import canvas, theme
 
 st.set_page_config(
     page_title="Aegis 控制台",
@@ -68,6 +71,8 @@ _wf_names = sorted(_WORKFLOWS) or [DEFAULT_WORKFLOW]
 # ---------------------------------------------------------------- 侧边栏
 with st.sidebar:
     st.markdown(theme.brand(), unsafe_allow_html=True)
+    view = st.radio("视图", ["执行控制台", "编排画布"], horizontal=True,
+                    label_visibility="collapsed", key="view_mode")
 
     if not os.environ.get("DEEPSEEK_API_KEY", "").strip():
         st.markdown(theme.warn_card(
@@ -124,6 +129,236 @@ with st.sidebar:
 
     st.markdown(theme.footer("aegis · workflows/*.yaml"),
                 unsafe_allow_html=True)
+
+
+# ---------------------------------------------------------------- 编排画布（可视化编辑）
+# 编辑对象就是 workflows/*.yaml 本身：界面改完 -> 校验 -> 原子写盘 -> 引擎按 mtime 热加载。
+# 所有控件值每轮直接写回「草稿 dict」（草稿不是 widget key，改它合法），
+# 加/删节点或还原时才 bump 一代 rev，让控件回到新默认值——避免 session_state 的老坑。
+
+def _draft_of(name: str) -> dict:
+    key = f"wf_draft::{name}"
+    if key not in st.session_state:
+        st.session_state[key] = spec_to_dict(load_workflow(name, use_cache=False))
+    return st.session_state[key]
+
+
+def _rev_of(name: str) -> int:
+    return int(st.session_state.get(f"wf_rev::{name}", 0))
+
+
+def _bump(name: str, pending: str | None = None) -> None:
+    st.session_state[f"wf_rev::{name}"] = _rev_of(name) + 1
+    if pending:
+        st.session_state[f"wf_pending::{name}"] = pending
+
+
+def _node_of(draft: dict, node_id: str) -> dict:
+    for node in draft.get("nodes") or []:
+        if node.get("id") == node_id:
+            return node
+    return {}
+
+
+def _split(text: str) -> list:
+    return [x.strip() for x in (text or "").replace("，", ",").split(",") if x.strip()]
+
+
+def _delete_node(name: str, node_id: str) -> None:
+    """回调里删节点：这里允许改 session_state（脚本尚未渲染控件）。"""
+    draft = st.session_state.get(f"wf_draft::{name}") or {}
+    draft["nodes"] = [n for n in draft.get("nodes") or [] if n.get("id") != node_id]
+    st.session_state.pop(f"wf_pending::{name}", None)
+    _bump(name)
+
+
+def _render_node_editor(draft: dict, name: str) -> None:
+    rev = _rev_of(name)
+    nodes = draft.setdefault("nodes", [])
+    ids = [str(n.get("id")) for n in nodes]
+
+    st.markdown('<div class="ag-sec">节点</div>', unsafe_allow_html=True)
+    if not ids:
+        st.markdown(theme.warn_card("这份定义还没有节点，先在下面添加一个入口节点。"),
+                    unsafe_allow_html=True)
+        return
+
+    pending = st.session_state.pop(f"wf_pending::{name}", None)
+    index = ids.index(pending) if pending in ids else 0
+    sel = st.selectbox("选择节点", ids, index=index, key=f"sel::{name}::{rev}")
+    node = _node_of(draft, sel)
+    k = f"{name}::{rev}::{sel}"          # 每个节点一套独立控件，切换节点不串值
+
+    types = sorted(NODE_TYPES)
+    ntype = st.selectbox("类型", types,
+                         index=types.index(node.get("type", "llm")),
+                         key=f"t::{k}")
+    label = st.text_input("显示名", value=node.get("label", ""), key=f"lb::{k}")
+
+    agent = tool = ""
+    if ntype == "llm":
+        names = [a["name"] for a in list_agents()]
+        agent = st.selectbox("Agent", names,
+                             index=names.index(node["agent"]) if node.get("agent") in names else 0,
+                             key=f"ag::{k}")
+    elif ntype == "tool":
+        tool_names = list_tools()
+        tool = st.selectbox("工具", tool_names,
+                            index=tool_names.index(node["tool"]) if node.get("tool") in tool_names else 0,
+                            key=f"tl::{k}")
+
+    context = st.text_area("上下文模板", value=node.get("context", "{prompt}"),
+                           height=64, key=f"cx::{k}")
+    publish = st.text_input("成功后写入变量 publish", value=node.get("publish", ""), key=f"pb::{k}")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        nxt = st.text_input("next", value=node.get("next", "") or "", key=f"nx::{k}")
+        on_success = st.text_input("on_success", value=node.get("on_success", "") or "", key=f"ok::{k}")
+        on_failure = st.text_input("on_failure", value=node.get("on_failure", "") or "", key=f"ng::{k}")
+    with c2:
+        on_exhausted = st.text_input("on_exhausted", value=node.get("on_exhausted", "") or "", key=f"ex::{k}")
+        on_resume = st.text_input("on_resume", value=node.get("on_resume", "") or "", key=f"rs::{k}")
+        max_retries = st.number_input("max_retries", value=int(node.get("max_retries") or 0),
+                                      min_value=0, step=1, key=f"mr::{k}")
+
+    routes_text = st.text_area(
+        "条件分支 routes（每行 标签=目标）",
+        value="\n".join("%s=%s" % (a, b) for a, b in (node.get("routes") or {}).items()),
+        height=64, key=f"rt::{k}")
+    parallel_text = st.text_input("parallel（逗号分隔）",
+                                  value=",".join(node.get("parallel") or []), key=f"pl::{k}")
+    join_text = st.text_input("join（逗号分隔，仅 join 节点）",
+                              value=",".join(node.get("join") or []), key=f"jn::{k}")
+
+    # 控件值即真相：直接写回草稿（草稿是普通 dict，不是 widget key）
+    fresh: dict = {"id": sel, "type": ntype}
+    for field_name, value in (("label", label), ("agent", agent), ("tool", tool),
+                              ("context", context), ("publish", publish), ("next", nxt),
+                              ("on_success", on_success), ("on_failure", on_failure),
+                              ("on_exhausted", on_exhausted), ("on_resume", on_resume)):
+        if value:
+            fresh[field_name] = value
+    routes = {}
+    for line in (routes_text or "").splitlines():
+        label_part, sep, target = line.partition("=")
+        if sep and label_part.strip() and target.strip():
+            routes[label_part.strip()] = target.strip()
+    if routes:
+        fresh["routes"] = routes
+    if max_retries:
+        fresh["max_retries"] = int(max_retries)
+    if _split(parallel_text):
+        fresh["parallel"] = _split(parallel_text)
+    if _split(join_text):
+        fresh["join"] = _split(join_text)
+    for i, item in enumerate(nodes):
+        if item.get("id") == sel:
+            nodes[i] = fresh
+            break
+
+    st.button("删除该节点", key=f"del::{k}", width="stretch",
+              on_click=_delete_node, args=(name, sel))
+
+    st.markdown('<div class="ag-sec">新增节点</div>', unsafe_allow_html=True)
+    n1, n2 = st.columns([1.2, 1])
+    with n1:
+        new_id = st.text_input("节点 id", key=f"nid::{name}::{rev}", placeholder="如 analyze")
+    with n2:
+        new_type = st.selectbox("类型", types, key=f"ntp::{name}::{rev}")
+    if st.button("添加节点", key=f"add::{name}::{rev}", width="stretch"):
+        candidate = (new_id or "").strip()
+        if not candidate:
+            st.warning("节点 id 不能为空")
+        elif candidate in ids:
+            st.warning(f"节点 id 已存在：{candidate}")
+        else:
+            nodes.append(blank_node(candidate, new_type))
+            _bump(name, pending=candidate)
+            st.rerun()
+
+
+def _render_workflow_actions(draft: dict, name: str) -> None:
+    ids = [str(n.get("id")) for n in (draft.get("nodes") or [])]
+    if ids:
+        current = draft.get("entry")
+        draft["entry"] = st.selectbox(
+            "入口节点 entry", ids,
+            index=ids.index(current) if current in ids else 0, key=f"entry::{name}")
+    draft["version"] = st.number_input(
+        "版本 version", value=int(draft.get("version") or 1), min_value=1, step=1,
+        key=f"ver::{name}")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("保存到 workflows/", type="primary", width="stretch",
+                     key=f"save::{name}"):
+            try:
+                path = save_workflow_data(name, draft)
+                st.success(f"已写入 {path.name}；引擎按 mtime 热加载，无需重启。")
+            except WorkflowError as exc:
+                st.error("保存被拒，文件未改动：")
+                for item in exc.errors:
+                    st.text(f"· {item}")
+    with c2:
+        if st.button("还原为文件内容", width="stretch", key=f"reload::{name}"):
+            st.session_state[f"wf_draft::{name}"] = spec_to_dict(
+                load_workflow(name, use_cache=False))
+            _bump(name)
+            st.rerun()
+
+
+def _render_workflow_editor(wf_names: list) -> None:
+    st.markdown(theme.panel_head(
+        "编排画布", "改 YAML 的图形化入口：所见即所得，保存后引擎热加载"),
+        unsafe_allow_html=True)
+
+    name = st.selectbox("工作流文件", wf_names, key="edit_wf")
+    try:
+        draft = _draft_of(name)
+    except WorkflowError as exc:
+        st.markdown(theme.warn_card(f"读取失败：{exc}"), unsafe_allow_html=True)
+        return
+
+    # 画布先占位：编辑控件在下方，等草稿写完再回填，保证画布画的是"刚改完"的版本
+    canvas_slot = st.empty()
+    caption_slot = st.empty()
+
+    edit_col, side_col = st.columns([1.25, 1], gap="large")
+    with edit_col:
+        st.markdown('<div class="ag-sec">节点编辑</div>', unsafe_allow_html=True)
+        _render_node_editor(draft, name)
+    with side_col:
+        st.markdown('<div class="ag-sec">流程与保存</div>', unsafe_allow_html=True)
+        _render_workflow_actions(draft, name)
+        st.markdown('<div class="ag-sec">YAML 预览</div>', unsafe_allow_html=True)
+        yaml_slot = st.empty()
+
+    spec = None
+    errors: list = []
+    try:
+        spec = validate_data(draft, name)
+    except WorkflowError as exc:
+        errors = exc.errors
+    except Exception as exc:                      # 防御：任何异常都别把页面拖垮
+        errors = [f"{type(exc).__name__}: {exc}"]
+
+    if spec is not None:
+        canvas_slot.markdown(canvas.render(spec), unsafe_allow_html=True)
+        caption_slot.caption(
+            f"{len(spec.nodes)} 节点 · {len(canvas.edges(spec))} 条转移 · 入口 {spec.entry} · "
+            "画布随编辑实时更新，点「保存到 workflows/」才落盘")
+        yaml_slot.code(spec_to_yaml(spec), language="yaml")
+    else:
+        canvas_slot.markdown(theme.warn_card(
+            "当前定义校验未通过，画布暂不可渲染：\n" + "\n".join(f"· {e}" for e in errors)),
+            unsafe_allow_html=True)
+        yaml_slot.code("\n".join(errors) or "（无内容）", language="text")
+
+
+if view == "编排画布":
+    _render_workflow_editor(_wf_names)
+    st.stop()
 
 
 # ---------------------------------------------------------------- 数据读取
