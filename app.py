@@ -15,7 +15,7 @@ from core import db
 from core.agents import list_agents
 from core.config import DEFAULT_WORKFLOW, WORKER_COUNT
 from core.engine import (
-    WORKER_STATE, get_workflow, resume_with_advice, start_engine, start_workflow,
+    EngineBusy, WORKER_STATE, get_workflow, resume_with_advice, start_engine, start_workflow,
 )
 from core.tools import get_workspace_dir, list_tools, list_workspace_files
 from core.workflow import (
@@ -53,11 +53,16 @@ def _fill_prompt(text: str) -> None:
 def _boot_engine():
     """引擎全局单例：整个 Streamlit 进程只启动一组 Worker，
     避免每个浏览器会话各起一个线程互相抢任务。"""
-    start_engine()
-    return True
+    try:
+        start_engine()
+        return None
+    except EngineBusy as exc:      # 另一个进程已在跑：不崩，明确提示
+        return str(exc)
 
 
-_boot_engine()
+ENGINE_BUSY = _boot_engine()
+if ENGINE_BUSY:                    # 引擎没抢到租约：界面照常可看历史，但不再派新任务
+    st.warning("引擎未启动 —— " + ENGINE_BUSY, icon="⚠️")
 
 # ---------------------------------------------------------------- 工作流目录
 _wf_err = ""
@@ -288,6 +293,13 @@ def _render_workflow_actions(draft: dict, name: str) -> None:
     draft["version"] = st.number_input(
         "版本 version", value=int(draft.get("version") or 1), min_value=1, step=1,
         key=f"ver::{name}")
+    draft["inputs"] = [line.strip() for line in str(st.text_area(
+        "入参文件 inputs（每行一个，examples/ 下的相对路径）",
+        value="\n".join(draft.get("inputs") or []),
+        key=f"inputs::{name}", height=88)).splitlines() if line.strip()]
+    if draft["inputs"]:
+        st.caption("启动任务时这些文件会先复制进工作区（真实输入才谈得上复现）："
+                   + "、".join(f"`{p}`" for p in draft["inputs"]))
 
     c1, c2 = st.columns(2)
     with c1:

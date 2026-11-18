@@ -80,6 +80,23 @@ def layout(spec: WorkflowSpec):
     for node_id in spec.nodes:                     # 从 entry 走不到的节点（校验会拦，这里兜底）
         depth.setdefault(node_id, fallback)
 
+    # 处理链（修复 Agent / 人工介入）本质是"回到上游"的旁路：
+    # BFS 会把它们和主链节点排在同一列，导致回边标签互相压住。
+    # 这里把这类节点按 YAML 顺序依次右移，形成"修复 -> 人工"的清晰顺序。
+    def _is_handler(node_id: str) -> bool:
+        succ = [t for t in spec.nodes[node_id].successors() if t in spec.nodes]
+        return bool(succ) and all(depth.get(t, 0) <= depth[node_id] for t in succ)
+
+    used_handler_cols: list[int] = []
+    for node_id in spec.nodes:
+        if not _is_handler(node_id):
+            continue
+        base = depth[node_id]
+        while base in used_handler_cols:
+            base += 1
+        used_handler_cols.append(base)
+        depth[node_id] = base
+
     by_col: dict[int, list[str]] = {}
     for node_id in spec.nodes:
         by_col.setdefault(depth[node_id], []).append(node_id)
@@ -113,7 +130,7 @@ def edges(spec: WorkflowSpec):
         elif node.next and not node.parallel:
             out.append({"src": node.id, "dst": node.next, "kind": "next", "label": ""})
         if node.on_failure:
-            label = ("失败·共 %d 次重试" % node.max_retries) if node.max_retries is not None else ""
+            label = ("失败×%d" % node.max_retries) if node.max_retries is not None else ""
             out.append({"src": node.id, "dst": node.on_failure,
                         "kind": "on_failure", "label": label})
         if node.on_exhausted:

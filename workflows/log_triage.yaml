@@ -1,0 +1,93 @@
+# Aegis 工作流：运维日志分析（企业日常 · 值班周报）
+#
+# 场景：值班同学每天要把 nginx 访问日志过一遍，找出 5xx 突增、慢接口、异常 IP。
+# 输入是固定夹具（examples/logs/nginx_access_20261118.log，120 行），所以结果可复现、可核算。
+# 失败策略：验收不通过 -> 自动修复（1 次）-> 熔断转人工。日志口径写错自动改是安全的，
+#           因为断言核对的是"数出来的事实"，改不对就会一直失败。
+name: log_triage
+version: 1
+description: >-
+  运维日志分析：给定 nginx 访问日志，产出值班周报 report.md（状态码分布 / 5xx 占比 /
+  Top IP / 慢请求 / 5xx 路径），断言用固定事实核对，错一个数就判失败。
+inputs:
+  - logs/nginx_access_20261118.log
+entry: analyze
+
+nodes:
+  - id: analyze
+    type: llm
+    label: 日志分析脚本
+    agent: coder
+    context: |
+      原始需求：
+      {prompt}
+
+      工作区里已经放好入参文件：logs/nginx_access_20261118.log
+      格式是 nginx 合并日志，每行末尾多一个字段是响应时间（秒），例如：
+      203.0.113.14 - - [18/Nov/2026:08:00:14 +0800] "GET /api/v1/orders HTTP/1.1" 200 4132 0.261 "-" "Mozilla/5.0 ..."
+
+      你写一个脚本读这个文件，统计后产出 report.md，并在 stdout 打印关键指标。
+
+      report.md 必须包含这几节：总览（总请求数）、状态码分布、5xx（数量与占比）、
+      Top5 来源 IP、慢请求 Top5（响应时间 > 1s）、5xx 最多的路径 Top3。
+
+      注意：日志有 120 行、18 KB，**不要用 read_file 去逐行读它**（工具输出会被截断，
+      读也读不全）。直接写解析脚本，让脚本自己去读文件——这才是你要交付的东西。
+
+      直接输出规格（REQUIREMENTS / ASSERTIONS / FILE 三段），不要解释。
+
+      已人工核对的事实（必须与脚本算出来的一致，写死用来防"假装分析过"）：
+        总行数 120；5xx 合计 20；5xx 占比 16.67%；慢请求(>1s) 4 条；
+        5xx 最多的路径是 /api/v1/pay/callback（10 次）。
+
+      断言至少包含：
+        FILE_EXISTS: report.md
+        REGEX: 总请求数[:：]?\s*120
+        REGEX: 5xx.*20
+        REGEX: 慢请求.*4
+        CONTAINS: 16.67
+        REGEX_FILE: report.md :: 状态码分布
+        REGEX_FILE: report.md :: /api/v1/pay/callback
+        NOT_CONTAINS: Traceback
+    publish: spec
+    next: verify
+
+  - id: verify
+    type: tool
+    label: 报告验收
+    tool: execute_spec
+    context: "{spec}"
+    on_success: summarize
+    on_failure: fixer
+    max_retries: 1
+    on_exhausted: human
+
+  - id: fixer
+    type: llm
+    label: 修复分析脚本
+    agent: fixer
+    context: |
+      验收失败了。按下面的失败原因改脚本，改完重新给出完整规格（REQUIREMENTS + ASSERTIONS）。
+      注意：日志统计口径不能"凑数"，断言核对的是真实数出来的结果。
+
+      失败原因：
+      {last_error}
+    next: verify
+
+  - id: human
+    type: human
+    label: 人工判断
+    on_resume: fixer
+
+  - id: summarize
+    type: llm
+    label: 值班结论
+    agent: coder
+    context: |
+      原始需求：
+      {prompt}
+
+      工作区里已经有 report.md。请读它，然后用 3 句话写值班结论：
+      ① 今天最严重的问题是什么；② 指向哪条路径/哪类错误；③ 建议下一步查什么。
+      只输出这 3 句，不要复述整张表。
+    on_success: done

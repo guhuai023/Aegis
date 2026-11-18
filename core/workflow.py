@@ -27,6 +27,7 @@ import yaml
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 WORKFLOWS_DIR = BASE_DIR / "workflows"
+EXAMPLES_DIR = BASE_DIR / "examples"    # 工作流入参文件的根目录
 
 # 保留终态：不是一个真实节点，只是转移目标里的终止标记
 TERMINAL = frozenset({"done", "failed"})
@@ -97,6 +98,7 @@ class WorkflowSpec:
     nodes: dict = field(default_factory=dict)  # id -> Node
     description: str = ""
     version: int = 1
+    inputs: tuple = ()            # examples/ 下的入参文件（相对路径）
     path: Path | None = None
 
     def node(self, node_id: str) -> Node:
@@ -207,6 +209,20 @@ def _build(data: dict, path: Path) -> WorkflowSpec:
             sub_workflow=_opt(item.get("sub_workflow")),
         )
 
+    inputs = []
+    for item in (data.get("inputs") or []):
+        rel = str(item).strip().replace("\\", "/")
+        if not rel:
+            continue
+        candidate = Path(rel)
+        if candidate.is_absolute() or ".." in candidate.parts:
+            errors.append(f"inputs 只允许 examples/ 下的相对路径，且不能包含 ..: {rel}")
+            continue
+        if not (EXAMPLES_DIR / candidate).is_file():
+            errors.append(f"inputs 引用的入参文件不存在: examples/{rel}")
+            continue
+        inputs.append(rel)
+
     if errors:
         raise WorkflowError(name, errors)
 
@@ -214,6 +230,7 @@ def _build(data: dict, path: Path) -> WorkflowSpec:
         name=name, entry=str(entry), nodes=nodes,
         description=str(data.get("description") or ""),
         version=int(data.get("version") or 1),
+        inputs=tuple(inputs),
         path=path,
     )
 
@@ -527,6 +544,8 @@ def spec_to_dict(spec: WorkflowSpec) -> dict:
     data: dict = {"name": spec.name}
     if spec.description:
         data["description"] = spec.description
+    if spec.inputs:
+        data["inputs"] = list(spec.inputs)
     data["version"] = spec.version
     data["entry"] = spec.entry
     data["nodes"] = nodes

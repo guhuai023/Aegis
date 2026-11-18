@@ -1,0 +1,95 @@
+# Aegis 工作流：数据质量门禁（企业日常 · 数仓上游把关）
+#
+# 场景：业务方送来一张脏订单表，先清洗，再出一份质量报告；清洗结果必须满足
+#       "无重复、无空值、日期规范、金额非负"才允许进入下游。
+# 关键设计：门禁语义 —— 验收失败**直接终止**，不自动改写。
+#           数据口径错误被模型自动"修好"，比失败更危险（错数据会静默流向报表）。
+name: data_quality_gate
+version: 1
+description: >-
+  数据质量门禁：对脏订单表做清洗 + 质量报告，断言强制校验"去重 / 非空 / 日期规范 /
+  金额非负"，不通过直接终止（不自动修复）。
+inputs:
+  - data/orders_dirty_202611.csv
+entry: plan
+
+nodes:
+  - id: plan
+    type: llm
+    label: 清洗规则拆解
+    agent: analyst
+    context: |
+      原始需求：
+      {prompt}
+
+      工作区入参：data/orders_dirty_202611.csv（表头 order_id,user_id,amount,order_date,region，共 45 行数据）。
+      已人工核对的脏数据事实：order_id 重复 2 条；金额为空 6 条；金额为负 2 条；
+      日期非 YYYY-MM-DD 2 条；区域字段带空格或非中文 2 条。
+
+      请把清洗规则拆成清单，逐条写清"怎么判定、怎么处理、处理后应该剩多少行"。
+      输出纯文本，分 4 行：去重规则 / 空值规则 / 日期规则 / 金额与区域规则。
+    publish: rules
+    next: clean
+
+  - id: clean
+    type: llm
+    label: 清洗脚本
+    agent: coder
+    context: |
+      原始需求：
+      {prompt}
+
+      清洗规则（下游分析同学给的）：
+      {rules}
+
+      你写脚本读 data/orders_dirty_202611.csv，产出两个文件：
+
+      1) clean_orders.csv —— 表头必须原样是：order_id,user_id,amount,order_date,region
+         规则：order_id 去重（保留首次出现）；丢弃金额为空的行；金额取绝对值（负金额视为录入错误）；
+         日期统一成 YYYY-MM-DD；区域去掉空格。
+      2) quality_report.csv —— 表头必须是：检查项,问题数,说明
+         每行一个检查项（重复 order_id / 空金额 / 负金额 / 非法日期 / 区域格式），写清问题数与处理方式。
+
+      脚本要打印：原始行数 / 清洗后行数 / 清洗后重复行数 / 清洗后空值数。
+
+      断言只校验**业务不变量**（这几条才是真正要守的门禁）：
+        FILE_EXISTS: clean_orders.csv
+        FILE_EXISTS: quality_report.csv
+        REGEX_FILE: clean_orders.csv :: ^order_id,user_id,amount,order_date,region$
+        REGEX_FILE: quality_report.csv :: ^检查项,问题数,说明$
+        REGEX_FILE: quality_report.csv :: 重复
+        REGEX_FILE: quality_report.csv :: 空
+        REGEX: 原始行数[:：]?\s*45
+        REGEX: 清洗后重复.*0
+        REGEX: 清洗后空值.*0
+        REGEX: 清洗后行数[:：]?\s*[1-9]\d*
+        REGEX_FILE: clean_orders.csv :: ^SO\d{10},\w+,\d+(\.\d+)?,\d{4}-\d{2}-\d{2},[^\s,]+$
+        NOT_CONTAINS: Traceback
+
+      注意两条纪律：
+      1. **不要钉死"清洗后行数=某个数字"**：口径有歧义（负金额是丢弃还是取绝对值、区域脏是修还是丢），
+         钉死只会制造假失败；行数断言只要保证"不为 0"，具体数字写进报告说明即可。
+      2. **不要给 quality_report.csv 的每一行钉具体内容**：只校验表头与关键检查项是否出现。
+    publish: spec
+    next: verify_quality
+
+  - id: verify_quality
+    type: tool
+    label: 质量门禁
+    tool: execute_spec
+    context: "{spec}"
+    on_success: report
+    on_failure: failed        # 门禁语义：不自动改写洗"干净"，错数据必须暴露给发起人
+
+  - id: report
+    type: llm
+    label: 质量结论
+    agent: coder
+    context: |
+      原始需求：
+      {prompt}
+
+      工作区里已经有 clean_orders.csv 和 quality_report.csv。请读这两个文件，输出 3 句话：
+      ① 这张表的整体质量如何；② 最需要业务方修正的字段是什么；③ 这批数据能否直接进下游。
+      只输出这 3 句。
+    on_success: done

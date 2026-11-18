@@ -8,12 +8,15 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from core.config import SANDBOX_TIMEOUT, INSTALL_TIMEOUT, WORKSPACES_DIR
+
+EXAMPLES_DIR = Path(__file__).resolve().parent.parent / "examples"   # 入参文件根目录
 
 # 当前正在执行哪个节点（引擎设置，用来把产物归属到节点上）
 _RUN_NODE: contextvars.ContextVar = contextvars.ContextVar("aegis_run_node", default=None)
@@ -44,15 +47,13 @@ class ExecResult:
 def parse_codegen_spec(text):
     """解析模型输出的结构化规格。
 
-    兼容三种形态：完整格式 / 缺少某节 / 完全无标记的纯代码（整体视为 main.py，
-    与旧版行为向后兼容）。
+    兼容三种形态：完整格式 / 缺少某节 / 完全无标记的纯代码（整体视为 main.py）。
+    注意：**断言节先解析**，没有断言的规格由 execute_spec 拒绝执行，
+    避免"模型吐了一段说明文字"被当成代码写进工作区（曾经真实发生过）。
     """
-    text = (text or "").replace("```python", "").replace("```", "").strip()
     spec = CodeSpec()
+    text = (text or "").replace("```python", "").replace("```py", "").replace("```", "").strip()
     if not text:
-        return spec
-    if "=== FILE:" not in text:
-        spec.files["main.py"] = text
         return spec
 
     def _section(header):
@@ -60,20 +61,28 @@ def parse_codegen_spec(text):
         return m.group(1).strip() if m else ""
 
     spec.requirements = [ln.strip() for ln in _section(SEC_REQUIREMENTS).splitlines() if ln.strip()]
-    spec.assertions = [ln.strip() for ln in _section(SEC_ASSERTIONS).splitlines() if ln.strip()]
+    spec.assertions = [_clean_assertion_line(ln)
+                       for ln in _section(SEC_ASSERTIONS).splitlines() if ln.strip()]
 
-    # 从正文里剥掉两个非文件节，避免被并入最后一个文件的内容
+    # 从正文里剥掉两个非文件节，剩下的才是代码
     body = re.sub(re.escape(SEC_REQUIREMENTS) + r".*?(?=\n===|\Z)", "", text, flags=re.S)
     body = re.sub(re.escape(SEC_ASSERTIONS) + r".*?(?=\n===|\Z)", "", body, flags=re.S)
+    body = body.strip()
 
-    parts = FILE_MARKER.split(body)  # [前导, 名1, 内容1, 名2, 内容2, ...]
-    for i in range(1, len(parts), 2):
-        name, content = parts[i].strip(), parts[i + 1].strip()
-        if name and content:
-            spec.files[name] = content
-    if not spec.files:
-        spec.files["main.py"] = text
+    if "=== FILE:" in body:
+        parts = FILE_MARKER.split(body)  # [前导, 名1, 内容1, 名2, 内容2, ...]
+        for i in range(1, len(parts), 2):
+            name, content = parts[i].strip(), parts[i + 1].strip()
+            if name and content:
+                spec.files[name] = content
+    elif body:
+        spec.files["main.py"] = body
     return spec
+
+
+def _clean_assertion_line(line):
+    """容忍模型把断言写成 markdown 列表（`- CONTAINS: x` / `* CONTAINS: x`）。"""
+    return re.sub(r"^\s*[-*+]\s+", "", str(line).strip())
 
 
 # ---------------- 任务工作区 ----------------
@@ -83,6 +92,30 @@ def get_workspace_dir(trace_id) -> Path:
     ws = WORKSPACES_DIR / trace_id
     ws.mkdir(parents=True, exist_ok=True)
     return ws
+
+
+def seed_workspace(trace_id, rel_paths, examples_dir=None):
+    """把 examples/ 下声明的入参文件复制进 trace 工作区（保留相对路径）。
+
+    真实场景必须有固定输入才谈得上复现：日志、脏数据表、待修脚本都走这里进工作区，
+    模型在 context 里看到的就是"工作区里有什么"，不用猜。
+    返回 [(相对路径, 字节数)]。
+    """
+    base = Path(examples_dir or EXAMPLES_DIR).resolve()
+    ws = get_workspace_dir(trace_id)
+    copied = []
+    for rel in rel_paths or []:
+        rel = str(rel).replace("\\", "/").strip()
+        if not rel:
+            continue
+        src = (base / rel).resolve()
+        if not str(src).startswith(str(base) + os.sep) or not src.is_file():
+            raise ValueError(f"入参文件非法或不存在: examples/{rel}")
+        dst = ws / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+        copied.append((rel, dst.stat().st_size))
+    return copied
 
 
 def _safe_relpath(name, ws: Path):
@@ -474,6 +507,13 @@ def run_workspace(trace_id, assertions, timeout=None):
 def execute_spec(trace_id, spec_text):
     """引擎统一入口：解析规格 -> 写工作区 -> 装依赖 -> 执行验收。返回 ExecResult"""
     spec = parse_codegen_spec(spec_text)
+    # 先卡格式：没有断言的规格无法验收，绝不能把散文/说明文字当代码写进工作区
+    if not spec.assertions:
+        return ExecResult(
+            False,
+            "规格缺少 === ASSERTIONS === 段（或该段为空）：没有可验收断言就拒绝执行。"
+            "请按 REQUIREMENTS / ASSERTIONS / FILE 三段结构重新给出规格。",
+            {}, "")
     if not spec.files:
         return ExecResult(False, "模型返回了空代码，验证锚点拒绝放行", {}, "")
     ws, written, skipped = prepare_workspace(trace_id, spec.files)

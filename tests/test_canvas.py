@@ -78,8 +78,11 @@ class TestEdges(unittest.TestCase):
         self.assertEqual(len(par), 2)
 
     def test_failure_label_mentions_retry_budget(self):
+        # 标签要短（长标签会压住节点框），但仍能看出"失败 + 重试预算"
         edges = [e for e in canvas.edges(self.code) if e["kind"] == "on_failure"]
-        self.assertTrue(any("重试" in e["label"] for e in edges))
+        self.assertTrue(any("失败" in e["label"] for e in edges))
+        self.assertTrue(any("×" in e["label"] for e in edges))
+        self.assertTrue(all(len(e["label"]) <= 8 for e in edges))
 
     def test_no_edge_points_to_unknown_node(self):
         for spec in (self.code, self.par):
@@ -236,6 +239,38 @@ class TestSaveWorkflow(unittest.TestCase):
         text = path.read_text(encoding="utf-8")
         self.assertIn("# 文件头注释", text)
         self.assertIn("name: tiny", text)
+
+
+class TestHandlerLayout(unittest.TestCase):
+    """修复 Agent 与人工介入是"回到上游"的旁路，必须错列摆放，否则回边标签互相压住。"""
+
+    def _spec(self):
+        from core.workflow import validate_data
+        return validate_data({
+            "name": "retry_demo", "entry": "coder",
+            "nodes": [
+                {"id": "coder", "type": "llm", "agent": "coder", "next": "verify"},
+                {"id": "verify", "type": "tool", "tool": "execute_spec",
+                 "on_success": "done", "on_failure": "fixer", "max_retries": 1,
+                 "on_exhausted": "human"},
+                {"id": "fixer", "type": "llm", "agent": "fixer", "next": "verify"},
+                {"id": "human", "type": "human", "on_resume": "fixer"},
+            ],
+        }, "retry_demo")
+
+    def test_fixer_and_human_get_distinct_columns(self):
+        from ui import canvas
+        pos = canvas.layout(self._spec())
+        col = lambda nid: (pos[nid][0] - canvas.PAD_X) // canvas.COL_W
+        self.assertNotEqual(col("fixer"), col("human"))
+        self.assertLess(col("verify"), col("fixer"))
+        self.assertLess(col("fixer"), col("human"))
+
+    def test_human_is_left_of_terminal(self):
+        from ui import canvas
+        pos = canvas.layout(self._spec())
+        col = lambda nid: (pos[nid][0] - canvas.PAD_X) // canvas.COL_W
+        self.assertLess(col("human"), col("__done"))
 
 
 if __name__ == "__main__":

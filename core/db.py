@@ -38,6 +38,12 @@ def init_db():
     c.execute('''CREATE TABLE IF NOT EXISTS trace_vars (
         trace_id TEXT, key TEXT, value TEXT, updated_at TEXT,
         PRIMARY KEY (trace_id, key))''')
+    # 引擎单写者租约：同一个库只允许一个引擎主进程认领任务。
+    # 多个引擎共存时，旧进程会用它启动时那份 Agent 定义抢走新任务（真实踩过三次），
+    # "任务由谁执行"不该取决于谁开机早。
+    c.execute('''CREATE TABLE IF NOT EXISTS engine_lease (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        pid INTEGER, started_at TEXT, heartbeat_at TEXT)''')
     c.execute("CREATE INDEX IF NOT EXISTS idx_tasks_pending ON tasks(status) WHERE status='pending'")
     c.execute("CREATE INDEX IF NOT EXISTS idx_tasks_trace ON tasks(trace_id)")
 
@@ -295,3 +301,55 @@ def node_statuses(trace_id, node_ids):
     for node_id, status in rows:
         latest[node_id] = status          # 后面的行覆盖前面的，天然取最新
     return {nid: latest.get(nid, "pending") for nid in node_ids}
+
+# ---------------- 引擎单写者租约 ----------------
+
+ENGINE_LEASE_TTL = 90          # 心跳超过这个秒数视为持有者已死（引擎每 20 秒续期一次）
+
+
+def _lease_age_seconds(heartbeat_at):
+    try:
+        hb = datetime.strptime(str(heartbeat_at), "%Y-%m-%d %H:%M:%S")
+    except (ValueError, TypeError):
+        return 10 ** 9
+    return (datetime.now() - hb).total_seconds()
+
+
+def acquire_engine_lease(owner_pid, ttl=ENGINE_LEASE_TTL):
+    """抢占引擎租约。返回 (ok, info)；ok=False 时 info 是占用者信息。"""
+    conn = get_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT pid, started_at, heartbeat_at FROM engine_lease WHERE id=1").fetchone()
+        now = _now()
+        if row and row[0] != owner_pid and _lease_age_seconds(row[2] or row[1]) < ttl:
+            conn.rollback()
+            return False, {"pid": row[0], "started_at": row[1], "heartbeat_at": row[2]}
+        conn.execute(
+            "INSERT OR REPLACE INTO engine_lease (id, pid, started_at, heartbeat_at)"
+            " VALUES (1, ?, COALESCE((SELECT started_at FROM engine_lease WHERE id=1), ?), ?)",
+            (owner_pid, now, now))
+        conn.commit()
+        return True, {"pid": owner_pid, "started_at": now, "heartbeat_at": now}
+    finally:
+        conn.close()
+
+
+def heartbeat_engine_lease(owner_pid):
+    conn = get_conn()
+    try:
+        conn.execute("UPDATE engine_lease SET heartbeat_at=? WHERE id=1 AND pid=?",
+                     (_now(), owner_pid))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def release_engine_lease(owner_pid):
+    conn = get_conn()
+    try:
+        conn.execute("DELETE FROM engine_lease WHERE id=1 AND pid=?", (owner_pid,))
+        conn.commit()
+    finally:
+        conn.close()

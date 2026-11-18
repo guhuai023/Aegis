@@ -1,0 +1,72 @@
+# Aegis 工作流：Excel 报表产出（企业日常 · 周会报表）
+#
+# 场景：把上周销售明细做成给老板看的 xlsx（明细 + 按大区汇总 + 合计行）。
+# 这条线专门覆盖两件企业里真实发生的事：
+#   1) 需要第三方依赖（openpyxl）——走任务级 venv 安装，装不上会明确报错；
+#   2) 产物是二进制（xlsx）——正则看不到内容，所以脚本必须"写完之后读回来校验"，
+#      断言再核对读回来的汇总值，避免"生成一个空壳文件也算过"。
+name: excel_report
+version: 1
+description: >-
+  Excel 周报产出：销售明细 csv -> report_202610.xlsx（明细 + 汇总 + 合计），
+  依赖 openpyxl，脚本读回自校验，断言核对合计金额 32312.00。
+inputs:
+  - data/sales_202610.csv
+entry: build
+
+nodes:
+  - id: build
+    type: llm
+    label: 报表脚本
+    agent: coder
+    context: |
+      原始需求：
+      {prompt}
+
+      工作区入参：data/sales_202610.csv（表头 日期,大区,渠道,金额，共 24 行数据）。
+      需要 openpyxl 读写 Excel，请在 REQUIREMENTS 里声明 openpyxl。
+
+      产出 report_202610.xlsx，包含两个 sheet：
+        · 明细：表头 + 24 行原始数据
+        · 汇总：表头（大区,金额）+ 四个大区各自合计 + 一行合计（合计金额 32312.00）
+
+      因为 xlsx 是二进制，断言无法直接看内容，所以脚本必须**写完再读回来**：
+      用 openpyxl 重新打开生成的文件，校验 sheet 名与合计金额，然后打印
+      `总金额: 32312.00` 和 `sheet: 明细,汇总`。
+
+      断言至少包含：
+        FILE_EXISTS: report_202610.xlsx
+        FILE_MIN_SIZE: report_202610.xlsx, 4000
+        CONTAINS: 总金额: 32312.00
+        REGEX: sheet.*明细
+        EXIT_CODE: 0
+        NOT_CONTAINS: Traceback
+    publish: spec
+    next: verify
+
+  - id: verify
+    type: tool
+    label: 报表验收
+    tool: execute_spec
+    context: "{spec}"
+    on_success: done
+    on_failure: fixer
+    max_retries: 1
+    on_exhausted: human
+
+  - id: fixer
+    type: llm
+    label: 修复报表脚本
+    agent: fixer
+    context: |
+      验收失败了。按失败原因改脚本，改完重新给出完整规格（REQUIREMENTS + ASSERTIONS）。
+      如果失败原因是依赖安装失败，请检查 REQUIREMENTS 里的包名是否写对（openpyxl 是纯 Python 包）。
+
+      失败原因：
+      {last_error}
+    next: verify
+
+  - id: human
+    type: human
+    label: 人工判断
+    on_resume: fixer

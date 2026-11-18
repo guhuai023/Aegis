@@ -16,6 +16,8 @@
 from __future__ import annotations
 
 import json
+import atexit
+import os
 import threading
 import time
 import traceback
@@ -30,7 +32,7 @@ from core.config import (
 )
 from core.tools import (
     TOOL_REGISTRY, ToolContext, get_workspace_dir, list_workspace_files,
-    reset_run_as_node, run_as_node,
+    reset_run_as_node, run_as_node, seed_workspace,
 )
 from core.workflow import (
     TERMINAL, WorkflowError, WorkflowSpec, load_workflow,
@@ -40,6 +42,10 @@ from core.workflow import (
 _ENGINE_STARTED = False
 
 # 同时在跑的 LLM 节点上限：多 Worker 时把并发压在这里，避免把 provider 打爆（429）
+class EngineBusy(RuntimeError):
+    """已有另一个引擎进程持有租约（防止旧进程用旧定义抢任务）。"""
+
+
 _LLM_SEM = threading.Semaphore(max(1, int(MAX_LLM_CONCURRENCY)))
 
 # 同一个 trace 的落盘/执行阶段必须串行：
@@ -79,6 +85,13 @@ def start_workflow(workflow_name: str, prompt: str, trace_id: str | None = None)
     trace_id = trace_id or uuid.uuid4().hex[:8]
     db.set_var(trace_id, "prompt", prompt)
     db.set_var(trace_id, "workflow", spec.name)
+    # 入参文件先落地：断言才有东西可校验，模型才不会"自己造一份假数据"
+    try:
+        seeded = seed_workspace(trace_id, getattr(spec, "inputs", ()) or ())
+        for rel, size in seeded:
+            db.log_event(trace_id, "INFO", f"📎 入参文件落地: {rel}（{size} B）")
+    except Exception as e:
+        db.log_event(trace_id, "ERROR", f"入参文件落地失败: {e}")
     _new_task(spec, trace_id, spec.entry, prompt, 0)
     db.log_event(trace_id, "INFO",
                  f"🚀 工作流 [{spec.name}] v{spec.version} 启动，入口节点 [{spec.entry}]")
@@ -108,6 +121,16 @@ def resume_with_advice(trace_id: str, task_id: str, advice: str) -> str:
     return target
 
 
+def _lease_heartbeat(interval=20):
+    """定期续期引擎租约，让僵尸进程的租约在 90 秒后自动失效。"""
+    while True:
+        time.sleep(interval)
+        try:
+            db.heartbeat_engine_lease(os.getpid())
+        except Exception:
+            return
+
+
 def start_engine(workers: int | None = None, capabilities=None) -> None:
     """启动 Worker。
 
@@ -118,6 +141,19 @@ def start_engine(workers: int | None = None, capabilities=None) -> None:
     global _ENGINE_STARTED
     if _ENGINE_STARTED:
         return
+    # 单写者：同库已有活跃引擎就拒绝启动，避免两个进程抢任务、且各自拿着不同的 Agent 定义
+    acquired, info = db.acquire_engine_lease(os.getpid())
+    if not acquired:
+        msg = (f"已有引擎在运行（pid {info.get('pid')}，心跳 {info.get('heartbeat_at')}）。"
+               f"为避免旧进程用旧 Agent 定义抢走任务，本次不启动 Worker。"
+               f"确认旧进程已退出后可设 AEGIS_ALLOW_MULTI_ENGINE=1 强制启动。")
+        print("⚠️ [引擎] " + msg)
+        if os.environ.get("AEGIS_ALLOW_MULTI_ENGINE") != "1":
+            raise EngineBusy(msg)
+        db.acquire_engine_lease(os.getpid(), ttl=0)
+        acquired, info = True, {"pid": os.getpid()}
+    atexit.register(db.release_engine_lease, os.getpid())
+    threading.Thread(target=_lease_heartbeat, daemon=True).start()
     _ENGINE_STARTED = True
     count = max(1, int(workers or WORKER_COUNT))
     plan = capabilities if capabilities is not None else WORKER_CAPABILITIES

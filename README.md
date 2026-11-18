@@ -75,12 +75,47 @@ Aegis/
 │   ├── tools.py            # 工具层：规格解析、工作区、依赖安装、断言验收、Agent 工具
 │   ├── db.py               # 任务黑板（原子认领、僵尸回收、trace 变量）
 │   └── config.py           # 全部可调参数
-├── agents/                 # router / coder / fixer / chat
-├── workflows/              # code_gen / parallel_demo
-├── tests/                  # 47 项离线测试（不联网）
+├── agents/                 # router / coder / fixer / analyst / chat
+├── workflows/              # 6 条工作流（软件交付 / 数据产线 / 三个企业日常场景 / 并行演示）
+├── examples/               # 入参夹具：真实输入才谈得上"复现"（日志、脏数据、销售明细）
+├── scripts/verify/         # 分层验证脚本（控制结构矩阵 / 调度器 / 工具边界 / 前端交互）
+├── tests/                  # 158 项离线测试（不联网）
 ├── docs/编排引擎改造说明.md  # 改造前后对照、字段参考、等价性证据
 └── requirements.txt
 ```
+
+---
+
+## 3.5 六条工作流（三条行业线 + 三个企业日常场景）
+
+同一个引擎，差异全部写在 YAML 里。每条都能用固定入参复现，产物可核算。
+
+| 工作流 | 业务场景 | 入参（`examples/`） | 交付物 | 失败策略 |
+|---|---|---|---|---|
+| `code_gen` | 软件交付：一句话需求 → 带验收的代码 | 无（自生成） | `main.py` + 验收报告 | 自动修复 ≤2 次 → 熔断转人工 |
+| `data_pipeline` | 数据产线：拆解 → 两条支线并行 → 合并 | 无（自生成） | 两份明细 + `summary.csv` | 验收失败直接终止 |
+| `log_triage` | **运维值班**：nginx 日志 → 值班周报 | `logs/nginx_access_20261118.log`（120 行） | `report.md` + 结论 | 自动修复 1 次 → 转人工 |
+| `data_quality_gate` | **数仓上游**：脏订单表清洗 + 质量门禁 | `data/orders_dirty_202611.csv`（45 行脏数据） | `clean_orders.csv` + `quality_report.csv` | **门禁语义：直接终止，不自动改写** |
+| `excel_report` | **周会报表**：明细 → Excel（明细 + 汇总 + 合计） | `data/sales_202610.csv`（24 行） | `report_202610.xlsx` | 自动修复 1 次 → 转人工 |
+| `parallel_demo` | 并行编排演示（不落盘） | 无 | 汇总文本 | — |
+
+实测（真实模型、真实沙箱）：
+
+| 工作流 | trace | 断言 | 成本 | 交付物 |
+|---|---|---|---|---|
+| `log_triage` | `d8d78c4f` | 13 条全过 | 6,480 tokens | `report.md` 1,241 B（120 请求 / 5xx 20 / 占比 16.67%，与人工核对一致） |
+| `data_quality_gate` | `c670d464` | 12 条全过 | 19,311 tokens | `quality_report.csv` 707 B + `clean_orders.csv` 1.7 KB |
+| `excel_report` | `f9e8ab41` | 8 条全过 | 3,825 tokens | `report_202610.xlsx` 6,131 B（明细 24 行 + 汇总合计 32312.00） |
+
+**入参文件怎么声明**（`inputs:` 是工作流级字段，启动时复制进该 trace 的工作区）：
+
+```yaml
+inputs:
+  - logs/nginx_access_20261118.log
+  - data/orders_dirty_202611.csv
+```
+
+只允许 `examples/` 下的相对路径，绝对路径与 `..` 在加载时就被拒绝——入参是"可复现的输入"，不是随手能读的任意文件。
 
 ---
 
@@ -275,6 +310,8 @@ Agent 工具走标准 Function Calling：模型返回 `tool_calls` → 引擎在
 - 画布保存会按定义重排 YAML：**文件头部注释保留，逐节点注释不保留**（界面上有提示）。
 - 依赖安装：整批 `pip install` 失败时会**逐个重装**，装不上的包跳过并在报告里点名（一行错依赖不会拖死整条 trace）；但这意味着"部分依赖缺失"是可能状态，断言里的 `import` 会如实暴露它。
 - Agent 工具轮数用尽时，会再做**一次不带工具的收尾调用**要结论；只有收尾也拿不到内容才判失败。
+- **规格格式是硬门槛**：输出里没有 `=== ASSERTIONS ===` 段就直接拒绝执行（不会把散文当代码写进工作区）。
+- **引擎是单写者**：同一个数据库只允许一个引擎进程持有租约（心跳 20s、90s 过期）。多开一个进程会打印"已有引擎在运行（pid …）"并拒绝启动 Worker——这条是踩过三次坑后加的：旧进程用着启动时的 Agent 快照抢走新任务，改完提示词却"没生效"。需要强制多开时设 `AEGIS_ALLOW_MULTI_ENGINE=1`。
 
 ---
 
@@ -290,7 +327,7 @@ Agent 工具走标准 Function Calling：模型返回 `tool_calls` → 引擎在
 
 | 层 | 覆盖 | 结果 |
 |---|---|---|
-| **单元/集成** | `unittest discover -s tests`：引擎、断言、产物隔离、调度、画布、Agent 工具、依赖降级、工具轮兜底 | **139 项全绿** |
+| **单元/集成** | `unittest discover -s tests`：引擎、断言、产物隔离、调度、画布、Agent 工具、入参文件、引擎租约、依赖降级、工具轮兜底 | **158 项全绿** |
 | **控制结构矩阵** | 顺序 / 条件分支命中与兜底 / 失败回边 / `max_retries` 预算 / 熔断转人工 / 人工建议恢复 / 并行扇出 + 汇合 / `sub_workflow` 明确拒绝 / 僵尸任务回收 / 并发认领不重复 | 14/14 |
 | **调度器** | 两 Worker 能力分区、认领计数、`scheduler_snapshot`、LLM 并发闸门排队 | 9/9 |
 | **工具边界** | 沙箱超时掐断、产物断言与 Agent 工具拒绝路径逃逸、`list_files`/`read_file`/`run_python`、真实 venv 装 `requests` | 11/11 |
@@ -304,6 +341,13 @@ Agent 工具走标准 Function Calling：模型返回 `tool_calls` → 引擎在
 | `parallel_demo` | 并行两支线 + 汇合，6 任务全 done | 365 tokens |
 | `data_pipeline` | 8 节点全 done，产出 `east_detail.csv` / `south_detail.csv` / `summary.csv` + `main.py` | 10,562 tokens |
 | 真实人工介入恢复 | 卡住的 trace 下发建议后继续跑到新结论（不再停在 waiting） | 27,230 tokens / 15 次调用 / 17 次工具 |
+| `log_triage` / `data_quality_gate` / `excel_report` | 三个企业日常场景，产物经人工核算一致 | 6,480 / 19,311 / 3,825 tokens |
+
+这一轮（三个企业场景）又暴露并修掉 3 个问题：
+
+5. **模型把散文当代码**：`log_triage` 首跑时模型改用工具后没按规格输出，引擎把整段中文说明写成 `main.py` → 改为**缺 `ASSERTIONS` 段直接拒绝执行**；
+6. **Agent 提示词里写死了某个工作流的输出格式**：`analyst` 原本硬编码"支线A/支线B"，导致 `data_quality_gate` 拿到的规则是别的流程的格式 → 格式归**编排节点**，Agent 只管能力；
+7. **多个引擎进程抢任务**：旧进程用旧 Agent 快照认领新任务，表现为"改了提示词却不生效" → 加**引擎单写者租约**（心跳 + 过期接管），并给画布处理链错列、失败标签缩短，避免图上的回边标签压住节点。
 
 这次全量验证**发现并修掉了 4 个真实缺陷**（都补了回归测试）：
 
