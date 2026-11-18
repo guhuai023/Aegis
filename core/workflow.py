@@ -547,11 +547,39 @@ def validate_data(data: dict, name: str | None = None) -> WorkflowSpec:
     return spec
 
 
+def _leading_comment_block(path: Path) -> list:
+    """读出文件顶部的注释块（含空行），保存时原样保留。
+
+    画布编辑走的是"spec -> dict -> YAML"，逐节点注释无法无损往返，
+    但文件头部的说明（为什么这么编排、字段约定）是文档资产，必须保住。
+    """
+    if not path.exists():
+        return []
+    try:
+        lines = path.read_text(encoding="utf-8-sig").splitlines()   # utf-8-sig 吃掉 BOM
+    except OSError:
+        return []
+    header = []
+    for line in lines:
+        if line.strip().startswith("#") or not line.strip():
+            header.append(line)
+        else:
+            break
+    while header and not header[-1].strip():
+        header.pop()
+    return header
+
+
 def save_workflow_data(name: str, data: dict) -> Path:
-    """校验通过才写盘，且用临时文件 + replace 保证不会留下半截 YAML。"""
+    """校验通过才写盘，且用临时文件 + replace 保证不会留下半截 YAML。
+
+    顶部注释块会被原样保留（逐节点注释不保留，界面上有提示）。
+    """
     spec = validate_data(data, name)
     path = WORKFLOWS_DIR / f"{name}.yaml"
-    text = spec_to_yaml(spec)
+    header = _leading_comment_block(path)
+    body = spec_to_yaml(spec)
+    text = ("\n".join(header) + "\n" + body) if header else body
     tmp = path.with_suffix(".yaml.tmp")
     tmp.write_text(text, encoding="utf-8")
     tmp.replace(path)

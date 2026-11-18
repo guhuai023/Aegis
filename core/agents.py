@@ -321,7 +321,12 @@ def ask_agent(role_prompt: str, user_prompt: str, model: str = "deepseek-chat",
             except Exception as e:
                 print(f"⚠️ [用量] 回调异常: {e}")
         if not content:
-            raise AgentError("模型在工具调用之后仍未给出最终内容")
+            # 模型查了一堆工具却没给结论（轮数用尽或直接返回空）：再要一次纯文本答复，
+            # 避免"工具用得挺好但没来得及说话"就整条 trace 判死。
+            content = _final_answer_without_tools(client, base, messages, usage, enabled)
+            if not content:
+                raise AgentError("模型在工具调用之后仍未给出最终内容（收尾调用也没产出）")
+            print("ℹ️ [工具循环] 已通过一次无工具调用收尾")
         return content
 
     if on_usage:
@@ -329,7 +334,32 @@ def ask_agent(role_prompt: str, user_prompt: str, model: str = "deepseek-chat",
             on_usage(usage)
         except Exception:
             pass
-    raise AgentError(f"工具调用轮数超过上限（{rounds} 轮）仍未收敛")
+    content = _final_answer_without_tools(client, base, messages, usage, enabled)
+    if content:
+        print("ℹ️ [工具循环] 轮数用尽，已通过一次无工具调用收尾")
+        return content
+    raise AgentError(f"工具调用轮数超过上限（{rounds} 轮）仍未收敛，且收尾调用没有产出内容")
+
+
+def _final_answer_without_tools(client, base, messages, usage, enabled) -> str:
+    """不带工具再要一次最终答复（工具循环的兜底出口）。"""
+    if not enabled:
+        return ""
+    try:
+        kwargs = dict(base)
+        kwargs.pop("tools", None)          # base 可能带工具定义，收尾必须去掉
+        kwargs.pop("tool_choice", None)
+        kwargs["messages"] = list(messages) + [{
+            "role": "user",
+            "content": "请基于以上工具结果直接给出最终答案（该答案会写入交付物），不要再调用工具。",
+        }]
+        resp = _request(client, kwargs)
+        usage["calls"] += 1
+        _accumulate(usage, resp)
+        return (resp.choices[0].message.content or "").strip()
+    except Exception as e:
+        print(f"⚠️ [工具循环] 收尾调用失败: {e}")
+        return ""
 
 
 def ask_agent_spec(spec: AgentSpec, user_prompt: str, *, ctx=None,

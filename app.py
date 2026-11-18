@@ -300,6 +300,7 @@ def _render_workflow_actions(draft: dict, name: str) -> None:
                 st.error("保存被拒，文件未改动：")
                 for item in exc.errors:
                     st.text(f"· {item}")
+        st.caption("保存会按定义重排 YAML：文件顶部注释保留，**逐节点注释不保留**。")
     with c2:
         if st.button("还原为文件内容", width="stretch", key=f"reload::{name}"):
             st.session_state[f"wf_draft::{name}"] = spec_to_dict(

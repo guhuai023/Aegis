@@ -211,6 +211,32 @@ class TestSaveWorkflow(unittest.TestCase):
         leftovers = list(self.tmp.glob("*.tmp"))
         self.assertEqual(leftovers, [])
 
+    def test_save_keeps_leading_comment_block(self):
+        """编辑保存会重排 YAML，但文件头的说明注释必须保留（文档资产）。"""
+        path = self.tmp / "tiny.yaml"
+        path.write_text("# 编排说明：为什么这么拆\n# 字段约定：entry 必须是 llm 节点\n\n"
+                        "name: tiny\nentry: a\nnodes: []\n", encoding="utf-8")
+        save_workflow_data("tiny", self._good())
+        text = path.read_text(encoding="utf-8")
+        self.assertTrue(text.startswith("# 编排说明"), text[:80])
+        self.assertIn("# 字段约定", text)
+        self.assertIn("name: tiny", text)
+
+    def test_save_without_existing_file_has_no_header(self):
+        save_workflow_data("fresh", self._good())
+        text = (self.tmp / "fresh.yaml").read_text(encoding="utf-8")
+        self.assertTrue(text.startswith("name:"), text[:40])
+
+    def test_save_keeps_header_even_with_bom(self):
+        """Windows 记事本/PowerShell 写的文件带 UTF-8 BOM，注释块也要认出来。"""
+        path = self.tmp / "bom.yaml"
+        path.write_text("\ufeff# 文件头注释\nname: tiny\nentry: a\nnodes: []\n",
+                        encoding="utf-8")
+        save_workflow_data("tiny", self._good())
+        text = path.read_text(encoding="utf-8")
+        self.assertIn("# 文件头注释", text)
+        self.assertIn("name: tiny", text)
+
 
 if __name__ == "__main__":
     unittest.main()

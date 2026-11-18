@@ -240,6 +240,25 @@ def _venv_python(ws: Path) -> Path:
     return ws / ("venv/Scripts/python.exe" if os.name == "nt" else "venv/bin/python")
 
 
+MAX_PIP_RETRY = 6        # 整批失败后最多逐个重试的包数，防依赖过多时无限拖长
+
+
+def _pip_install(vpy: Path, args, env, flags):
+    """跑一次 pip install（args 可以是 -r 文件，也可以是单个包名）。返回 (ok, detail)。"""
+    cmd = [str(vpy), "-m", "pip", "install", "--disable-pip-version-check", "--no-input"] + list(args)
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=INSTALL_TIMEOUT,
+                           env=env, creationflags=flags)
+    except subprocess.TimeoutExpired:
+        return False, f"pip 安装超时（>{INSTALL_TIMEOUT}s，可在 core/config.py 调整）"
+    except Exception as e:
+        return False, f"pip 执行异常: {e}"
+    if r.returncode == 0:
+        return True, ""
+    return False, (r.stderr or r.stdout or "")[-800:]
+
+
 def ensure_venv(trace_id, requirements):
     """按需创建任务级 venv 并安装依赖（按内容哈希跳过重复安装）。
 
@@ -268,14 +287,23 @@ def ensure_venv(trace_id, requirements):
             if r.returncode != 0:
                 return False, f"创建虚拟环境失败:\n{(r.stderr or '')[-800:]}"
         (ws / "requirements.txt").write_text("\n".join(reqs), encoding="utf-8")
-        r = subprocess.run([str(vpy), "-m", "pip", "install", "--disable-pip-version-check",
-                            "--no-input", "-r", str(ws / "requirements.txt")],
-                           capture_output=True, text=True, encoding="utf-8",
-                           errors="replace", timeout=INSTALL_TIMEOUT,
-                           env=env, creationflags=flags)
-        if r.returncode != 0:
-            detail = (r.stderr or r.stdout or "")[-800:]
-            return False, f"pip 安装失败（{len(reqs)} 个包）:\n{detail}"
+        ok, detail = _pip_install(vpy, ["-r", str(ws / "requirements.txt")], env, flags)
+        if not ok:
+            # 整批失败时逐个重装：模型偶尔写错包名/版本号，一行非法 requirements
+            # 不该把整条 trace 判死，也不该让其它正常依赖一起失败。
+            good, bad, bad_detail = [], [], detail
+            for pkg in reqs[:MAX_PIP_RETRY]:
+                pkg_ok, pkg_detail = _pip_install(vpy, [pkg], env, flags)
+                (good if pkg_ok else bad).append(pkg)
+                if not pkg_ok:
+                    bad_detail = pkg_detail
+            if not good:
+                return False, f"pip 安装失败（{len(reqs)} 个包）:\n{bad_detail}"
+            hash_file.write_text(req_hash, encoding="utf-8")
+            msg = f"依赖部分安装成功: {', '.join(good)}"
+            if bad:
+                msg += f"；以下包失败已跳过: {', '.join(bad)}"
+            return True, msg
         hash_file.write_text(req_hash, encoding="utf-8")
         return True, f"依赖安装完成: {', '.join(reqs)}"
     except subprocess.TimeoutExpired:

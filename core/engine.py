@@ -229,6 +229,12 @@ def _step(capabilities=None, worker_name="worker-0"):
 
 def _execute(node, trace_id, context, retry):
     """按节点类型执行，返回 (ok, output, report)。"""
+    # sub_workflow 只做了解析与校验，展开执行尚未实现。
+    # 必须在执行前明确拒绝——否则会退化成"按节点类型跑一遍并返回成功"，
+    # 让用户以为子流程真的执行了（静默假成功比报错危险得多）。
+    if getattr(node, "sub_workflow", None):
+        return False, "", (f"sub_workflow 展开执行尚未实现（引用了 [{node.sub_workflow}]）；"
+                           "请把子流程节点显式写进当前工作流，或改用独立工作流单独运行")
     variables = _variables_for(trace_id, node, context, retry)
     prompt_ctx = render_context(node.context, variables)
 
