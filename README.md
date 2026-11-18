@@ -318,6 +318,8 @@ Agent 工具走标准 Function Calling：模型返回 `tool_calls` → 引擎在
 ## 11. 文档
 
 - [编排引擎改造说明](docs/编排引擎改造说明.md)：改造前后对照、字段参考、等价性与迁移证据。
+- [方案书（PDF）](docs/方案书.pdf)：按赛题要求的 8 个章节撰写，正文约 1.24 万字 / 27 页，含架构图、代码片段与系统截图。同一份内容的 Markdown 源在 [docs/方案书.md](docs/方案书.md)，图片在 `docs/images/`。
+  - 重新生成：`python docs/build_proposal.py`（Markdown → DOCX），再用 Word 打开 DOCX 另存为 PDF；亦可只改 Markdown 后重跑这条命令。
 
 ---
 
