@@ -138,16 +138,23 @@ def ensure_app():
     raise RuntimeError("应用启动超时")
 
 
-def launch_browser():
+def launch_browser(headless=False):
     edge = r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
     if not Path(edge).exists():
         edge = r"C:\Program Files\Microsoft\Edge\Application\msedge.exe"
-    prof = OUT / "edge_profile"
+    prof = OUT / ("edge_headless" if headless else "edge_profile")
     prof.mkdir(parents=True, exist_ok=True)
-    cmd = [edge, f"--app={APP_URL}", "--window-position=0,0", "--window-size=1616,955",
-           f"--user-data-dir={prof}", "--remote-debugging-port=9223",
-           "--remote-allow-origins=*", "--no-first-run", "--no-default-browser-check",
-           "--disable-features=CalculateNativeWinOcclusion", "--force-device-scale-factor=1"]
+    if headless:
+        cmd = [edge, "--headless=new", "--disable-gpu", "--hide-scrollbars",
+               "--window-size=1600,900", f"--user-data-dir={prof}",
+               "--remote-debugging-port=9223", "--remote-allow-origins=*",
+               "--no-first-run", "--no-default-browser-check", "--disable-extensions",
+               "--force-device-scale-factor=1", APP_URL]
+    else:
+        cmd = [edge, f"--app={APP_URL}", "--window-position=0,0", "--window-size=1616,955",
+               f"--user-data-dir={prof}", "--remote-debugging-port=9223",
+               "--remote-allow-origins=*", "--no-first-run", "--no-default-browser-check",
+               "--disable-features=CalculateNativeWinOcclusion", "--force-device-scale-factor=1"]
     p = subprocess.Popen(cmd)
     time.sleep(6)
     return p
@@ -264,6 +271,48 @@ def audio_track(mp3, dur, out_m4a):
                     "-af", "adelay=250|250,apad", "-t", f"{dur:.2f}",
                     "-ar", "44100", "-ac", "2", "-c:a", "aac", "-b:a", "160k", str(out_m4a)],
                    check=True)
+
+
+# ---------------------------------------------------------------- 页面帧录制（不碰屏幕）
+def capture_frames(dur, frames_dir, fps=12, actions=()):
+    """按固定帧率从页面取帧；actions 是 [(相对秒, fn)]。
+
+    为什么不用 gdigrab：屏幕录制会把你桌面上任何压在窗口上方的程序一起录进去
+    （真实事故：录制时用户在用电脑，别的窗口被录进成片）。CDP 只拍页面，
+    无窗口渲染时连浏览器窗口都不存在，天然免疫。
+    """
+    import shutil as _sh
+    if Path(frames_dir).exists():
+        _sh.rmtree(frames_dir)
+    Path(frames_dir).mkdir(parents=True, exist_ok=True)
+    t0 = time.time()
+    idx = 0
+    duties = sorted(actions, key=lambda a: a[0])
+    while True:
+        elapsed = time.time() - t0
+        if elapsed >= dur:
+            break
+        while duties and elapsed >= duties[0][0]:
+            try:
+                duties.pop(0)[1]()
+            except Exception as e:
+                print(f"    [warn] 录制中动作失败: {e}")
+        cdp.shot_jpeg(Path(frames_dir) / f"f{idx:05d}.jpg")
+        idx += 1
+        target = idx / fps
+        pause = target - (time.time() - t0)
+        if pause > 0:
+            time.sleep(pause)
+    return idx
+
+
+def encode_frames(frames_dir, fps, out_path):
+    cmd = [FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
+           "-framerate", str(fps), "-i", str(Path(frames_dir) / "f%05d.jpg"),
+           "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+           "-pix_fmt", "yuv420p", "-r", str(fps), str(out_path)]
+    subprocess.run(cmd, check=True)
+    return out_path
 
 
 # ---------------------------------------------------------------- 镜头定义
@@ -450,6 +499,9 @@ def main():
     ap.add_argument("--from", dest="start", type=int, default=0)
     ap.add_argument("--only", default="", help="只跑某个镜头 key")
     ap.add_argument("--reuse", action="store_true", help="复用已在运行的应用与浏览器窗口")
+    ap.add_argument("--capture", choices=["cdp", "screen"], default="cdp",
+                    help="cdp=只拍页面（默认，免疫窗口遮挡）；screen=抓屏幕（旧的，会被别的窗口污染）")
+    ap.add_argument("--fps", type=int, default=12, help="cdp 模式的帧率")
     ap.add_argument("--assemble", action="store_true",
                     help="不录制，用已有片段重新合成（配合 --only 重录个别镜头后使用）")
     args = ap.parse_args()
@@ -481,21 +533,25 @@ def main():
         rect = fit_client_1600x900(hwnd)
     else:
         app = ensure_app()
-        browser = launch_browser()
-        hwnd = None
-        for _ in range(30):
-            hwnd = _find_window(browser.pid)
-            if hwnd:
-                break
-            time.sleep(1)
-        if not hwnd:
-            raise RuntimeError("找不到浏览器窗口")
-        rect = fit_client_1600x900(hwnd)
+        headless = args.capture == "cdp"
+        browser = launch_browser(headless=headless)
+        rect = (0, 0, CLIENT_W, CLIENT_H)
+        if not headless:
+            hwnd = None
+            for _ in range(30):
+                hwnd = _find_window(browser.pid)
+                if hwnd:
+                    break
+                time.sleep(1)
+            if not hwnd:
+                raise RuntimeError("找不到浏览器窗口")
+            rect = fit_client_1600x900(hwnd)
     try:
         print(f"  客户区: {rect}（应为 (0,0,1600,900) 附近）")
 
         print("[2/5] 连接 CDP")
         cdp.connect("127.0.0.1:8507")
+        cdp.set_viewport(CLIENT_W, CLIENT_H)
         time.sleep(1)
 
         test_tail = None if args.dry else real_test_tail()
@@ -547,7 +603,13 @@ def main():
 
             seg_v = SEG_DIR / f"seg_{key}.mp4"
             seg_a = SEG_DIR / f"seg_{key}.m4a"
-            record(rect, dur, seg_v, shot.get("during") or [])
+            if args.capture == "cdp":
+                fdir = OUT / "frames" / key
+                capture_frames(dur, fdir, fps=args.fps, actions=shot.get("during") or [])
+                encode_frames(fdir, args.fps, seg_v)
+                shutil.rmtree(fdir, ignore_errors=True)
+            else:
+                record(rect, dur, seg_v, shot.get("during") or [])
             audio_track(audio, dur, seg_a)
             manifest[key] = round(dur, 2)
             manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2),

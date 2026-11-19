@@ -5,6 +5,7 @@
 """
 import json
 import time
+from pathlib import Path
 
 import requests
 import websocket
@@ -551,3 +552,16 @@ def go_canvas(workflow=None, expect=None, settle=2.0, tries=4):
             print("    [warn] 画布未切到", workflow)
     scroll_top()
     time.sleep(settle)
+
+def set_viewport(w=1600, h=900):
+    cmd("Emulation.setDeviceMetricsOverride",
+        {"width": w, "height": h, "deviceScaleFactor": 1, "mobile": False})
+
+
+def shot_jpeg(path, quality=82):
+    """只取页面内容（不碰屏幕）：别的窗口压在上面也拍不到。"""
+    import base64
+    r = cmd("Page.captureScreenshot", {"format": "jpeg", "quality": quality,
+                                       "captureBeyondViewport": False})
+    Path(path).write_bytes(base64.b64decode(r["data"]))
+    return path
