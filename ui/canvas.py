@@ -168,7 +168,10 @@ def _node_svg(node, x, y):
         sub = "等待 " + ", ".join(node.join)
     tip = "%s（%s）" % (node.id, TYPE_NAME.get(node.type, node.type))
     if node.context and node.context != "{prompt}":
-        tip += "\n上下文: " + node.context[:160]
+        # 压成单行：SVG 会经 Streamlit 的 Markdown 解析，提示里一旦出现空行，
+        # 整段 HTML 会被截断并插入 <p>，导致后面几个节点的 <rect> 落进 <title> 里不渲染。
+        tip += " 上下文: " + " ".join(node.context.split())[:160]
+    tip = " ".join(tip.split())
     return (
         '<g><title>%s</title>'
         '<rect x="%d" y="%d" width="%d" height="%d" rx="7" fill="%s" stroke="%s" stroke-width="1"/>'
@@ -228,7 +231,8 @@ def _terminal_svg(term, x, y, count):
     return ('<g><title>%s（%d 条转移到此）</title>'
             '<circle cx="%d" cy="%d" r="%d" fill="%s" stroke="%s" stroke-width="2"/>'
             '<text x="%d" y="%d" font-size="10.5" fill="%s" text-anchor="middle">%s</text></g>'
-            % (term, count, x, y, TERM_R, fill, stroke, x, y + 4, stroke, term))
+            % (html.escape(term), count, x, y, TERM_R, fill, stroke, x, y + 4,
+               stroke, html.escape(term)))
 
 
 def legend_svg():

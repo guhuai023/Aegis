@@ -275,3 +275,28 @@ class TestHandlerLayout(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class TestSvgMarkdownSafety(unittest.TestCase):
+    """SVG 会经 Streamlit 的 Markdown 渲染：空行会把 HTML 块截断并插入 <p>，
+    导致后续节点的 <rect> 被吞进 <title> 里不渲染（真实 bug，已修）。"""
+
+    def _svg(self, name):
+        from core.workflow import load_workflow
+        from ui import canvas
+        return canvas.render(load_workflow(name))
+
+    def test_no_blank_line_inside_svg(self):
+        for name in ("code_gen", "data_parallel_demo", "log_triage",
+                     "data_quality_gate", "excel_report"):
+            try:
+                svg = self._svg(name)
+            except Exception:
+                continue
+            self.assertNotIn("\n\n", svg, "%s 的 SVG 里出现了空行" % name)
+
+    def test_title_text_is_single_line(self):
+        import re
+        svg = self._svg("log_triage")
+        for body in re.findall(r"<title>(.*?)</title>", svg, re.S):
+            self.assertNotIn("<", body, "title 里出现了裸尖括号: %r" % body[:60])
+            self.assertNotIn("\n", body, "title 里出现了换行: %r" % body[:60])

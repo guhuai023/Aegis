@@ -79,7 +79,7 @@ Aegis/
 ├── workflows/              # 6 条工作流（软件交付 / 数据产线 / 三个企业日常场景 / 并行演示）
 ├── examples/               # 入参夹具：真实输入才谈得上"复现"（日志、脏数据、销售明细）
 ├── scripts/verify/         # 分层验证脚本（控制结构矩阵 / 调度器 / 工具边界 / 前端交互）
-├── tests/                  # 158 项离线测试（不联网）
+├── tests/                  # 160 项离线测试（不联网）
 ├── docs/编排引擎改造说明.md  # 改造前后对照、字段参考、等价性证据
 └── requirements.txt
 ```
@@ -318,7 +318,9 @@ Agent 工具走标准 Function Calling：模型返回 `tool_calls` → 引擎在
 ## 11. 文档
 
 - [编排引擎改造说明](docs/编排引擎改造说明.md)：改造前后对照、字段参考、等价性与迁移证据。
-- [方案讲解 PPT](docs/Aegis-赛道一-方案讲解.pptx)：基于官方模板，16 页（封面 + 正文 14 页 + 结束页），含架构、编排字段、6 条工作流、8 类断言、自我循环、演示实拍、158 项测试；每页都写了演讲备注。
+- [演示视频](docs/Aegis-演示视频.mp4)：**3 分 04 秒 · 1600×900**，AI 配音（edge-tts）+ 自动操作录制，无真人出镜/配音；字幕在同名 `.srt`（软字幕轨）。画面全部取自真实运行记录。
+  - 重新生成：`python scripts/demo/build_demo.py --reuse`（分镜与旁白写在脚本里；逐镜录制、按镜头名存片段，`--only <key>` 可只重录一个镜头，`--assemble` 只重新合成）。
+- [方案讲解 PPT](docs/Aegis-赛道一-方案讲解.pptx)：基于官方模板，16 页（封面 + 正文 14 页 + 结束页），含架构、编排字段、6 条工作流、8 类断言、自我循环、演示实拍、160 项测试；每页都写了演讲备注。
   - 重新生成：`python docs/build_ppt.py`（需按脚本内 TEMPLATE 路径放置官方模板）。
 - [方案书（PDF）](docs/方案书.pdf)：按赛题要求的 8 个章节撰写，正文约 1.24 万字 / 27 页，含架构图、代码片段与系统截图。同一份内容的 Markdown 源在 [docs/方案书.md](docs/方案书.md)，图片在 `docs/images/`。
   - 重新生成：`python docs/build_proposal.py`（Markdown → DOCX），再用 Word 打开 DOCX 另存为 PDF；亦可只改 Markdown 后重跑这条命令。
@@ -331,7 +333,7 @@ Agent 工具走标准 Function Calling：模型返回 `tool_calls` → 引擎在
 
 | 层 | 覆盖 | 结果 |
 |---|---|---|
-| **单元/集成** | `unittest discover -s tests`：引擎、断言、产物隔离、调度、画布、Agent 工具、入参文件、引擎租约、依赖降级、工具轮兜底 | **158 项全绿** |
+| **单元/集成** | `unittest discover -s tests`：引擎、断言、产物隔离、调度、画布、Agent 工具、入参文件、引擎租约、依赖降级、工具轮兜底 | **160 项全绿** |
 | **控制结构矩阵** | 顺序 / 条件分支命中与兜底 / 失败回边 / `max_retries` 预算 / 熔断转人工 / 人工建议恢复 / 并行扇出 + 汇合 / `sub_workflow` 明确拒绝 / 僵尸任务回收 / 并发认领不重复 | 14/14 |
 | **调度器** | 两 Worker 能力分区、认领计数、`scheduler_snapshot`、LLM 并发闸门排队 | 9/9 |
 | **工具边界** | 沙箱超时掐断、产物断言与 Agent 工具拒绝路径逃逸、`list_files`/`read_file`/`run_python`、真实 venv 装 `requests` | 11/11 |
