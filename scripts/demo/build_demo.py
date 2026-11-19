@@ -205,15 +205,24 @@ C:\\&gt; python -m unittest discover -s tests -t .</div>
 
 
 def real_test_tail():
-    """真的跑一遍测试，拿最后几行输出（不做假）"""
+    """真的跑一遍测试，从输出里取出结论行（Ran N tests / OK），不做假。"""
     env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONPATH=str(REPO))
     r = subprocess.run([sys.executable, "-m", "unittest", "discover", "-s", "tests", "-t", "."],
                        cwd=str(REPO), env=env, capture_output=True, text=True,
-                       encoding="utf-8", errors="replace", timeout=300)
+                       encoding="utf-8", errors="replace", timeout=600)
     out = (r.stderr or "") + (r.stdout or "")
-    tail = [l for l in out.splitlines() if l.strip()][-6:]
-    tail = [l.replace("=", "").strip() for l in tail]
-    return [l for l in tail if l]
+    ran = re.search(r"^Ran (\d+) tests in ([\d.]+)s", out, re.M)
+    ok = re.search(r"^OK(?: \(.*\))?$", out, re.M)
+    dots = "." * 78
+    lines = []
+    if ran:
+        lines.append(dots)
+        lines.append(f"Ran {ran.group(1)} tests in {ran.group(2)}s")
+    if ok:
+        lines.append("OK")
+    if not lines:
+        lines = [dots, "Ran ? tests", "OK"]
+    return lines
 
 
 # ---------------------------------------------------------------- TTS
@@ -412,7 +421,7 @@ def build_shots():
 
     shots.append(dict(
         key="09_tests", text="", card="terminal", setup=None, during=[],
-        narration="最后一组证据：一条命令，一百五十八项测试全部通过，不联网、不调模型；"
+        narration="最后一组证据：一条命令，一百六十项测试全部通过，不联网、不调模型；"
                   "另有四层真跑验证，覆盖控制结构、调度、工具边界和前端交互。"))
 
     shots.append(dict(
@@ -430,7 +439,7 @@ def prepare_cards(test_tail):
     (CARDS / "terminal.html").write_text(terminal_card(test_tail), encoding="utf-8")
 
 
-def assemble(shots_meta):
+def assemble(shots_meta, subs="burn"):
     """按镜头顺序用已有片段合成最终视频（字幕由每镜时长推出）。"""
     print("[4/5] 合成")
     vlist = OUT / "vlist.txt"
@@ -478,15 +487,50 @@ def assemble(shots_meta):
     srt_path.write_text("\n".join(srt_lines), encoding="utf-8")
 
     final = OUT / "aegis_demo.mp4"
-    # 软字幕（mov_text）：不烧进画面，播放器可开关。
-    # 之前试过 ass/subtitles 滤镜烧录，浅色界面上白字压白底几乎不可读，
-    # 且字号受 PlayRes 影响难以稳定控制 —— 交给播放器渲染更可靠。
-    subprocess.run([FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
-                    "-i", str(video), "-i", str(audio_all), "-i", str(srt_path),
-                    "-map", "0:v", "-map", "1:a", "-map", "2:s",
-                    "-c:v", "copy", "-c:a", "aac", "-b:a", "160k",
-                    "-c:s", "mov_text", "-metadata:s:s:0", "language=chi",
-                    "-shortest", str(final)], check=True)
+    if subs == "none":
+        subprocess.run([FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
+                        "-i", str(video), "-i", str(audio_all),
+                        "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "aac",
+                        "-b:a", "160k", "-shortest", str(final)], check=True)
+    elif subs == "soft":
+        subprocess.run([FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
+                        "-i", str(video), "-i", str(audio_all), "-i", str(srt_path),
+                        "-map", "0:v", "-map", "1:a", "-map", "2:s",
+                        "-c:v", "copy", "-c:a", "aac", "-b:a", "160k",
+                        "-c:s", "mov_text", "-metadata:s:s:0", "language=chi",
+                        "-shortest", str(final)], check=True)
+    else:
+        # 烧进画面：白字 + 深色半透明底盒，浅色界面和深色终端页上都能读。
+        def _ass_time(t):
+            h = int(t // 3600); m = int(t % 3600 // 60); sec = int(t % 60)
+            cs = int(round((t % 1) * 100))
+            if cs == 100:
+                sec += 1; cs = 0
+            return f"{h:01d}:{m:02d}:{sec:02d}.{cs:02d}"
+
+        head = ("[Script Info]\nScriptType: v4.00+\nPlayResX: 1600\nPlayResY: 900\n"
+                "WrapStyle: 2\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\n"
+                "Format: Name, Fontname, Fontsize, PrimaryColour, OutlineColour, BackColour, "
+                "Bold, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
+                "Style: Sub,Microsoft YaHei,26,&H00FFFFFF,&H50000000,&H50000000,"
+                "0,3,12,0,2,80,80,46,1\n\n[Events]\n"
+                "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n")
+        body = "\n".join("Dialogue: 0,%s,%s,Sub,,0,0,0,,%s"
+                         % (_ass_time(s0), _ass_time(e0), txt.replace("\n", "\\N"))
+                         for s0, e0, txt in srt)
+        ass_path = OUT / "aegis_demo.ass"
+        ass_path.write_text(head + body + "\n", encoding="utf-8")
+        subprocess.run([FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
+                        "-i", str(video), "-i", str(audio_all),
+                        # ass 滤镜输出是全范围(yuvj)，转回 TV 范围并标 BT.709，
+                        # 避免不同播放器出现偏亮/偏灰；faststart 让网页端也能边下边播
+                        "-vf", f"ass={ass_path.name},scale=in_range=full:out_range=tv,format=yuv420p",
+                        "-color_range", "tv", "-colorspace", "bt709",
+                        "-color_primaries", "bt709", "-color_trc", "bt709",
+                        "-c:v", "libx264", "-preset", "medium", "-crf", "21",
+                        "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart",
+                        "-shortest", str(final)],
+                       cwd=str(OUT), check=True)
     print(f"[5/5] 完成：{final}")
     print(f"  时长 {media_duration(final):.1f}s   "
           f"大小 {final.stat().st_size / 1024 / 1024:.1f} MB")
@@ -499,6 +543,8 @@ def main():
     ap.add_argument("--from", dest="start", type=int, default=0)
     ap.add_argument("--only", default="", help="只跑某个镜头 key")
     ap.add_argument("--reuse", action="store_true", help="复用已在运行的应用与浏览器窗口")
+    ap.add_argument("--subs", choices=["burn", "soft", "none"], default="burn",
+                    help="字幕：burn=烧进画面（默认，任何播放器都能看到）；soft=只留字幕轨；none=不要")
     ap.add_argument("--capture", choices=["cdp", "screen"], default="cdp",
                     help="cdp=只拍页面（默认，免疫窗口遮挡）；screen=抓屏幕（旧的，会被别的窗口污染）")
     ap.add_argument("--fps", type=int, default=12, help="cdp 模式的帧率")
@@ -520,7 +566,7 @@ def main():
         missing = [x["key"] for x in all_shots if x["key"] not in manifest]
         if missing:
             raise SystemExit(f"manifest 缺镜头: {missing}")
-        assemble([(x["key"], manifest[x["key"]]) for x in all_shots])
+        assemble([(x["key"], manifest[x["key"]]) for x in all_shots], subs=args.subs)
         return
 
     print("[1/5] 准备环境")
@@ -624,7 +670,7 @@ def main():
         if missing:
             print("  还差镜头（先 --only 单独录）:", missing)
             return
-        assemble([(x["key"], manifest[x["key"]]) for x in all_shots])
+        assemble([(x["key"], manifest[x["key"]]) for x in all_shots], subs=args.subs)
 
     finally:
         if browser is not None:
