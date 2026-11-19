@@ -22,6 +22,7 @@ Aegis 是一个 **编排即数据（orchestration-as-data）** 的多 Agent 执�
 | B · 无 Key 验证 | Python 3.11+ | 10 分钟 | 打开 10 条**真实运行记录**（含熔断转人工、真实失败）、跑 160 项离线测试 |
 | C · 填 Key 真跑 | DeepSeek API Key | 30 分钟 | 真的下发任务，看节点全绿、产物落盘 |
 
+- **两个版本**：常规版 13 MB（需 Python + 联网装依赖）；离线版约 100 MB（内置 `runtime/python314/` 嵌入式解释器，**不需要装 Python、不需要联网**，双击即启动）
 - 详细步骤、常见问题、诚实清单：**[docs/提交说明-如何复刻.md](docs/提交说明-如何复刻.md)**
 - 没有 Key 也能看到证据：`seed/` 里有 10 条真实 trace 与其交付物（`aegis_platform.db` 与 `workspace/`
   本身是运行时产物、不进 git，靠 `scripts/setup_demo_data.py` 装进本地库）

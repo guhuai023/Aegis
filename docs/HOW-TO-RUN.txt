@@ -1,6 +1,10 @@
 Aegis - manual start (works with any Windows, no PowerShell needed)
 ===================================================================
 
+OFFLINE EDITION: if this package contains runtime\python314\python.exe, you need
+NOTHING installed - no Python, no network. Just double-click run.bat. Everything
+below applies to the normal edition only.
+
 Requirements: Windows 10/11, Python 3.11 - 3.14 (tested on 3.14.6).
 First run needs internet to install dependencies.
 

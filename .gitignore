@@ -28,3 +28,7 @@ docs/*.docx
 
 # 打包产物（由 scripts/package_submission.py 生成，不入库）
 dist/
+# 离线版构建产物（体积大，由 scripts/offline/build_offline_runtime.py 生成，不进 git）
+/runtime/
+/wheelhouse/
+/.cache/

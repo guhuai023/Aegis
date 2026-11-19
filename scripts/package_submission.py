@@ -113,7 +113,7 @@ def build(files, out_zip):
     return rows
 
 
-def verify(out_zip):
+def verify(out_zip, offline=False):
     print("\n[自检] 解压到干净目录，模拟评委首次打开 ...")
     tmp = Path(tempfile.mkdtemp(prefix="aegis_judge_check_"))
     try:
@@ -151,7 +151,10 @@ def verify(out_zip):
             print("[失败] run.bat 在 cmd 下不能正常解析")
             return False
 
-        r1 = subprocess.run([py, "scripts/verify/verify_env.py", "--with-tests"],
+        py_verify = str(root / "runtime" / "python314" / "python.exe") if offline else py
+        if offline:
+            print(f"  用包内运行时执行自检: {py_verify}")
+        r1 = subprocess.run([py_verify, "scripts/verify/verify_env.py", "--with-tests"],
                             cwd=str(root), env=env, capture_output=True, text=True,
                             encoding="utf-8", errors="replace", timeout=900)
         print("\n--- verify_env 输出（尾部）---")
@@ -180,7 +183,7 @@ def verify(out_zip):
             print("[失败] 演示 trace 少于 10 条")
             return False
 
-        r2 = subprocess.run([py, "scripts/verify/verify_matrix.py"],
+        r2 = subprocess.run([py_verify, "scripts/verify/verify_matrix.py"],
                             cwd=str(root), env=env, capture_output=True, text=True,
                             encoding="utf-8", errors="replace", timeout=900)
         tail = "\n".join(r2.stdout.strip().splitlines()[-4:])
@@ -197,19 +200,29 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--verify", action="store_true", help="打包后解压并自检")
     ap.add_argument("--no-video", action="store_true", help="不包含演示视频")
+    ap.add_argument("--offline", action="store_true",
+                    help="打离线版：把 runtime/ 便携运行时一起打包（约 +90MB，评委无需 Python/网络）")
     ap.add_argument("--name", default=None,
                     help="指定的包名（不含 .zip），例如 \"赛道一+队伍名+Aegis\"；默认按日期生成")
     args = ap.parse_args()
 
     stamp = datetime.now().strftime("%Y%m%d")
+    suffix = ("-离线版" if args.offline else "") + ("-无视频" if args.no_video else "")
     if args.name:
-        out_zip = DIST / f"{args.name}.zip"
+        out_zip = DIST / f"{args.name}{suffix}.zip"
     else:
-        out_zip = DIST / f"Aegis-提交包-{stamp}{'-无视频' if args.no_video else ''}.zip"
+        out_zip = DIST / f"Aegis-提交包-{stamp}{suffix}.zip"
 
     print("=" * 68)
     print("  打包提交物")
     print("=" * 68)
+    if args.offline:
+        rt = REPO / "runtime" / "python314" / "python.exe"
+        if not rt.exists():
+            print("[错误] 没有 runtime/python314/python.exe，先运行:")
+            print("       python scripts/offline/build_offline_runtime.py")
+            sys.exit(1)
+        INCLUDE_TREES.extend(["runtime", "scripts/offline"])
     files = collect(with_video=not args.no_video)
     rows = build(files, out_zip)
     size = out_zip.stat().st_size
@@ -231,7 +244,7 @@ def main():
         print(f"    {sz/1024/1024:>6.2f} MB  {name}")
 
     if args.verify:
-        ok = verify(out_zip)
+        ok = verify(out_zip, offline=args.offline)
         sys.exit(0 if ok else 1)
     print("\n提示：加 --verify 可以解压到干净目录自动自检（推荐提交前跑一次）。")
 
