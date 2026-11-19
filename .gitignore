@@ -13,11 +13,18 @@ __pycache__/
 *.db-shm
 .env
 
-# 任务工作区（运行时产物）
-workspace/
+# 任务工作区（运行时产物，仅根目录）
+/workspace/
 
 # 其他
 acl-recovery/
 
 # 方案书 DOCX 是 PDF 的中间产物，可用 docs/build_proposal.py 重新生成
 docs/*.docx
+
+# 演示数据要进提交包（上面 *.db 规则会挡住，这里放行）
+!seed/
+!seed/aegis_platform.db
+
+# 打包产物（由 scripts/package_submission.py 生成，不入库）
+dist/

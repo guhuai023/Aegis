@@ -1,0 +1,1 @@
+{"verify_quality": {"spec": ["main.py"], "artifacts": ["clean_orders.csv", "quality_report.csv"]}}

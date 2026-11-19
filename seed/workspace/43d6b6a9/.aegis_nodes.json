@@ -1,0 +1,1 @@
+{"verify_a": {"spec": ["main.py"], "artifacts": ["east_detail.csv"]}, "verify_b": {"spec": ["main.py"], "artifacts": ["south_detail.csv"]}, "verify_merge": {"spec": ["main.py"], "artifacts": ["summary.csv"]}}
