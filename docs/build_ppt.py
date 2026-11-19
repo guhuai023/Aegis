@@ -7,7 +7,7 @@
     设计元素全部在版式层（整幅背景图 + 左右页眉 logo），页面只有文本框
     内容页小标题位于 (0.39, 0.90)，24 号加粗；正文 20 号
 
-用法：改 PERSONAL 里四项即可重新生成。
+用法：填仓库根目录的 personal.json 四项，然后 python docs/build_ppt.py（直接覆盖 docs 里的交付件）。
 依赖：官方模板 2026未来杯PPT模版.pptx（不在仓库内，需按 TEMPLATE 路径放置）；配图从 docs/images/ 读取。
 """
 from pptx import Presentation
@@ -19,13 +19,27 @@ from pptx.enum.shapes import MSO_SHAPE
 TEMPLATE = r"D:\下载\电影\2026未来杯PPT模版.pptx"
 OUTPUT = r"D:\下载\项目1\Aegis-赛道一-方案讲解-v2.pptx"
 
-# ---- 需要你替换的个人信息（留空则保留模板的标签） ----
-PERSONAL = {
-    "队伍": "",
-    "演讲人": "",
-    "指导教师": "",
-    "学校": "",
-}
+# ---- 个人信息：优先读仓库根目录的 personal.json（不用改 Python） ----
+# 留空则封面只显示标签（"团队名称：" 后面空着）。
+import json as _json
+import sys as _sys
+from pathlib import Path as _Path
+
+_PERSONAL_KEYS = ["队伍", "演讲人", "指导教师", "学校"]
+PERSONAL = {k: "" for k in _PERSONAL_KEYS}
+
+
+def _load_personal(path):
+    """从 json 覆盖四项；文件不存在就保持空值。"""
+    if path and _Path(path).exists():
+        data = _json.loads(_Path(path).read_text(encoding="utf-8-sig"))
+        for k in _PERSONAL_KEYS:
+            v = str(data.get(k, "") or "").strip()
+            if v:
+                PERSONAL[k] = v
+
+
+_load_personal(_Path(__file__).resolve().parent.parent / "personal.json")
 
 # ---- 视觉常量：跟随模板（蓝底 + 白底蓝页眉） ----
 FONT = "微软雅黑"          # 模板标注为思源黑体；本机未装 Bold 字重，统一用微软雅黑保证任何机器不乱版式
@@ -40,6 +54,19 @@ C_ORANGE = RGBColor(0xD9, 0x6A, 0x1B)
 C_LINE = RGBColor(0xD6, 0xE0, 0xF0)
 C_WHITE = RGBColor(0xFF, 0xFF, 0xFF)
 C_SUB = RGBColor(0xB9, 0xCB, 0xEF)   # 深色页上的次级文字
+
+import argparse as _argparse
+
+_ap = _argparse.ArgumentParser(description="生成 Aegis 方案讲解 PPT")
+_ap.add_argument("--personal", default=None, help="个人信息 json（默认仓库根 personal.json）")
+_ap.add_argument("--out", default=r"D:\gh666\Aegis\docs\Aegis-赛道一-方案讲解.pptx",
+                 help="输出 pptx 路径")
+_ap.add_argument("--template", default=TEMPLATE, help="官方模板路径")
+_args = _ap.parse_args()
+if _args.personal is not None:
+    _load_personal(_args.personal)
+OUTPUT = _args.out
+TEMPLATE = _args.template
 
 prs = Presentation(TEMPLATE)
 LAY = {lay.name: lay for lay in prs.slide_layouts}
@@ -306,9 +333,11 @@ for sh in s1.shapes:
             r2.font.bold = True
             r2.font.name = FONT
             r2.font.color.rgb = C_WHITE
-notes(s1, "开场：大家好，我们的作品是 Aegis —— 面向软件交付的多 Agent 协同平台。"
-          "一句话：我们不追求更大的模型，而是把 Agent 协作做成可解释、可复现、可审计的工程系统。"
-          "（请在封面补团队名称、演讲人、指导教师、学校）")
+_note = ("开场：大家好，我们的作品是 Aegis —— 面向软件交付的多 Agent 协同平台。"
+         "一句话：我们不追求更大的模型，而是把 Agent 协作做成可解释、可复现、可审计的工程系统。")
+if any(not PERSONAL[k] for k in _PERSONAL_KEYS):
+    _note += "（请在封面补团队名称、演讲人、指导教师、学校）"
+notes(s1, _note)
 
 # ================================================================== 2 目录
 s2 = prs.slides[1]
