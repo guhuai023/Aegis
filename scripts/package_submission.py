@@ -197,10 +197,15 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--verify", action="store_true", help="打包后解压并自检")
     ap.add_argument("--no-video", action="store_true", help="不包含演示视频")
+    ap.add_argument("--name", default=None,
+                    help="指定的包名（不含 .zip），例如 \"赛道一+队伍名+Aegis\"；默认按日期生成")
     args = ap.parse_args()
 
     stamp = datetime.now().strftime("%Y%m%d")
-    out_zip = DIST / f"Aegis-提交包-{stamp}{'-无视频' if args.no_video else ''}.zip"
+    if args.name:
+        out_zip = DIST / f"{args.name}.zip"
+    else:
+        out_zip = DIST / f"Aegis-提交包-{stamp}{'-无视频' if args.no_video else ''}.zip"
 
     print("=" * 68)
     print("  打包提交物")
