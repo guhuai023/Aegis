@@ -28,7 +28,8 @@ DIST = REPO / "dist"
 ROOT_IN_ZIP = "Aegis"
 
 INCLUDE_FILES = [
-    "app.py", "run.bat", "requirements.txt", "README.md", ".env.example",
+    "app.py", "run.bat", "run.ps1", "requirements.txt", "README.md", ".env.example",
+    ".gitattributes", "docs/HOW-TO-RUN.txt",
     "docs/方案书.pdf", "docs/方案书.md", "docs/Aegis-赛道一-方案讲解.pptx",
     "docs/Aegis-演示视频.srt", "docs/提交说明-如何复刻.md",
 ]
@@ -124,6 +125,31 @@ def verify(out_zip):
         py = sys.executable
         print(f"  目录: {root}")
         print(f"  解释器: {py}")
+
+        # 回归检查：run.bat 必须纯 ASCII，run.ps1 必须是 UTF-8 BOM ——
+        # 中文 Windows 的 cmd 用 GBK 读批处理，bat 里一旦有非 ASCII 字节，
+        # 双击就会把命令结构读坏（真实事故：评委机器上双击报一串乱码）。
+        bat = (root / "run.bat").read_bytes()
+        ps1 = (root / "run.ps1").read_bytes()
+        bad = [(i, b) for i, b in enumerate(bat) if b > 127]
+        print(f"  run.bat 非 ASCII 字节: {len(bad)}{'（应为 0）' if bad else '  OK'}")
+        print(f"  run.ps1 有 UTF-8 BOM: {ps1.startswith(b'\xef\xbb\xbf')}")
+        if bad or not ps1.startswith(b"\xef\xbb\xbf"):
+            print("[失败] 启动脚本编码不对，双击 run.bat 会乱码")
+            return False
+        if b"\r\n" not in bat[:200]:
+            print("[警告] run.bat 不是 CRLF，cmd 的 goto/label 可能读错")
+
+        env["AEGIS_NO_PAUSE"] = "1"
+        from_env = dict(env, PYTHONPATH=str(root))
+        r0 = subprocess.run(["cmd", "/c", "run.bat -DryRun"], cwd=str(root), env=from_env,
+                            capture_output=True, text=True, encoding="utf-8",
+                            errors="replace", timeout=300)
+        print("\n--- run.bat -DryRun 输出（尾部）---")
+        print("\n".join(r0.stdout.strip().splitlines()[-8:]))
+        if r0.returncode != 0 or "is not recognized" in r0.stdout:
+            print("[失败] run.bat 在 cmd 下不能正常解析")
+            return False
 
         r1 = subprocess.run([py, "scripts/verify/verify_env.py", "--with-tests"],
                             cwd=str(root), env=env, capture_output=True, text=True,

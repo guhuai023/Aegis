@@ -13,7 +13,7 @@ Aegis 是一个 **编排即数据（orchestration-as-data）** 的多 Agent 执�
 
 ## 0. 提交包与复刻（评委入口）
 
-拿到的是 `Aegis-提交包-<日期>.zip`，解压后**双击 `run.bat`** 即可启动（自动建虚拟环境、装依赖、
+拿到的是 `Aegis-提交包-<日期>.zip`，解压后**双击 `run.bat`** 即可启动（`run.bat` 是纯 ASCII 外壳，逻辑在 `run.ps1`；加 `-DryRun` 只检查不安装；没有 PowerShell 时按 `docs/HOW-TO-RUN.txt` 手动执行）（自动建虚拟环境、装依赖、
 装演示数据、开 8507 端口）。三条路径按时间选：
 
 | 路径 | 需要什么 | 约耗时 | 做什么 |
