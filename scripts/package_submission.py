@@ -28,6 +28,8 @@ DIST = REPO / "dist"
 ROOT_IN_ZIP = "Aegis"
 
 INCLUDE_FILES = [
+    # 入口文件放最前：评委解压后第一眼看到什么
+    "00-先看我.html", "00-先看我.txt",
     "app.py", "run.bat", "run.ps1", "requirements.txt", "README.md", ".env.example",
     ".gitattributes", "docs/HOW-TO-RUN.txt",
     "docs/方案书.pdf", "docs/方案书.md", "docs/Aegis-赛道一-方案讲解.pptx",
@@ -79,7 +81,9 @@ def collect(with_video=True):
         print("[警告] 下面这些没找到，包里会缺：")
         for a in ans:
             print("   -", a)
-    return sorted(set(files))
+    entry = [f for f in set(files) if f.name.startswith("00-")]
+    rest = [f for f in set(files) if not f.name.startswith("00-")]
+    return entry + sorted(rest)
 
 
 def sha256(path):
@@ -129,6 +133,32 @@ def verify(out_zip, offline=False):
         # 回归检查：run.bat 必须纯 ASCII，run.ps1 必须是 UTF-8 BOM ——
         # 中文 Windows 的 cmd 用 GBK 读批处理，bat 里一旦有非 ASCII 字节，
         # 双击就会把命令结构读坏（真实事故：评委机器上双击报一串乱码）。
+        # 入口文件：评委解压后第一眼能不能看到、链接是否都指向包内真实文件
+        entry_html = root / "00-先看我.html"
+        entry_txt = root / "00-先看我.txt"
+        for f in (entry_html, entry_txt):
+            if not f.exists():
+                print(f"[失败] 缺少入口文件 {f.name}")
+                return False
+        if not entry_txt.read_bytes().startswith(b"\xef\xbb\xbf"):
+            print("[警告] 00-先看我.txt 没有 BOM，记事本双击可能显示乱码")
+        import re as _re
+        html = entry_html.read_text(encoding="utf-8")
+        missing = []
+        for href in _re.findall(r'href="([^"#]+)"', html):
+            if href.startswith(("http://", "https://", "mailto:")):
+                continue
+            if not (root / href.replace("/", "\\")).exists():
+                missing.append(href)
+        print(f"  入口页链接检查: {len(_re.findall(r'href=', html))} 个，失效 {len(missing)} 个")
+        if missing:
+            print(f"[失败] 入口页里这些链接指向的文件不在包里: {missing}")
+            return False
+        for must in ("docs/方案书.pdf", "docs/Aegis-赛道一-方案讲解.pptx", "docs/Aegis-演示视频.mp4"):
+            if must not in html:
+                print(f"[失败] 入口页没提到 {must}")
+                return False
+
         bat = (root / "run.bat").read_bytes()
         ps1 = (root / "run.ps1").read_bytes()
         bad = [(i, b) for i, b in enumerate(bat) if b > 127]

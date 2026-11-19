@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Aegis 提交包 · 先看我</title>
+<style>
+  :root { --ink:#0F1B2D; --body:#333D4D; --blue:#0B49C3; --line:#DFE6F0; --bg:#F4F7FC; }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:0 0 60px; font-family:"Microsoft YaHei","PingFang SC","Segoe UI",sans-serif;
+         color:var(--body); background:var(--bg); line-height:1.75; }
+  header { background:linear-gradient(135deg,#0B49C3,#08306F); color:#fff; padding:34px 40px 28px; }
+  header h1 { margin:0 0 8px; font-size:28px; letter-spacing:.5px; }
+  header p { margin:0; opacity:.9; font-size:15px; }
+  .wrap { max-width:980px; margin:0 auto; padding:0 40px; }
+  section { background:#fff; border:1px solid var(--line); border-radius:10px; padding:22px 26px; margin-top:22px; }
+  h2 { margin:0 0 14px; font-size:20px; color:var(--ink); border-left:4px solid var(--blue);
+       padding-left:10px; }
+  h3 { margin:18px 0 6px; font-size:16px; color:var(--ink); }
+  table { width:100%; border-collapse:collapse; margin:10px 0 4px; font-size:14.5px; }
+  th, td { border:1px solid var(--line); padding:9px 11px; text-align:left; vertical-align:top; }
+  th { background:#EEF3FB; color:var(--ink); font-weight:600; white-space:nowrap; }
+  code { background:#F1F4F9; border:1px solid #E1E7F0; border-radius:4px; padding:1px 6px;
+         font-family:Consolas,"Courier New",monospace; font-size:13.5px; color:#0B3D91; }
+  pre { background:#0F1B2D; color:#E6EDF7; padding:14px 16px; border-radius:8px; overflow-x:auto;
+        font-family:Consolas,"Courier New",monospace; font-size:13.5px; line-height:1.6; }
+  a { color:var(--blue); text-decoration:none; border-bottom:1px solid rgba(11,73,195,.35); }
+  a:hover { border-bottom-color:var(--blue); }
+  .tag { display:inline-block; padding:1px 8px; border-radius:10px; font-size:12.5px;
+         background:#E8F1FF; color:#0B49C3; margin-right:6px; }
+  .warn { border-left:4px solid #E8A33D; background:#FFF9EC; padding:12px 16px; border-radius:6px; }
+  .ok   { border-left:4px solid #2E9E5B; background:#F1FBF4; padding:12px 16px; border-radius:6px; }
+  ul { margin:8px 0 4px; padding-left:22px; }
+  li { margin:4px 0; }
+  .muted { color:#7A8699; font-size:13px; }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wrap">
+    <h1>Aegis · 多 Agent 协作与可信交付</h1>
+    <p>2026 未来杯 · 赛道一《Agent 编排创新应用》· 赛题一　|　提交包使用说明</p>
+  </div>
+</header>
+
+<div class="wrap">
+
+<section>
+  <h2>0. 三分钟决定怎么用这个包</h2>
+  <table>
+    <tr><th>你现在的目的</th><th>打开什么</th><th>大约耗时</th></tr>
+    <tr>
+      <td><b>只想看作品</b>（方案书 / PPT / 演示视频）</td>
+      <td>直接双击下面的文件，不用装任何东西：<br>
+        <a href="docs/方案书.pdf">docs/方案书.pdf</a>（27 页方案书）<br>
+        <a href="docs/Aegis-赛道一-方案讲解.pptx">docs/Aegis-赛道一-方案讲解.pptx</a>（16 页讲解，讲稿在备注里）<br>
+        <a href="docs/Aegis-演示视频.mp4">docs/Aegis-演示视频.mp4</a>（3 分 04 秒，字幕已烧录）
+      </td>
+      <td>5 分钟</td>
+    </tr>
+    <tr>
+      <td><b>想验证它真能跑</b>（我这里有 Python）</td>
+      <td>双击根目录的 <code>run.bat</code>，然后在浏览器打开 <code>http://127.0.0.1:8507</code></td>
+      <td>10 分钟</td>
+    </tr>
+    <tr>
+      <td><b>想自己下任务真跑</b>（我有 DeepSeek API Key）</td>
+      <td>先填 <code>.env</code> 里的 <code>DEEPSEEK_API_KEY</code>，再双击 <code>run.bat</code>，在「任务下发」里点「启动任务」</td>
+      <td>30 分钟</td>
+    </tr>
+  </table>
+  <p class="muted">完整复现步骤（含常见问题、诚实清单）在
+     <a href="docs/提交说明-如何复刻.md">docs/提交说明-如何复刻.md</a>；
+     纯英文手动启动步骤在 <a href="docs/HOW-TO-RUN.txt">docs/HOW-TO-RUN.txt</a>。</p>
+</section>
+
+<section>
+  <h2>1. 交付物在哪（路径 + 是什么）</h2>
+  <table>
+    <tr><th>文件</th><th>是什么</th><th>怎么看</th></tr>
+    <tr>
+      <td><a href="docs/方案书.pdf"><b>docs/方案书.pdf</b></a><br><span class="muted">约 1.4 MB</span></td>
+      <td>方案书，27 页 / 约 1.25 万字，按赛题要求含 8 个必填章节（问题、架构、关键设计、可复现性、AI 使用、评测、风险、结论）</td>
+      <td>任何 PDF 阅读器</td>
+    </tr>
+    <tr>
+      <td><a href="docs/Aegis-赛道一-方案讲解.pptx"><b>docs/Aegis-赛道一-方案讲解.pptx</b></a><br><span class="muted">约 4.3 MB</span></td>
+      <td>讲解 PPT，16 页（封面 + 14 页正文 + 结束页）；<b>每页备注里都写了讲稿</b>，可直接照着讲</td>
+      <td>PowerPoint / WPS；看备注：视图 → 备注页</td>
+    </tr>
+    <tr>
+      <td><a href="docs/Aegis-演示视频.mp4"><b>docs/Aegis-演示视频.mp4</b></a><br><span class="muted">约 8 MB</span></td>
+      <td>演示视频 3 分 04 秒，1600×900；<b>AI 配音 + 字幕已烧进画面</b>（任何播放器都能看到字幕），另附同名 .srt</td>
+      <td>任何播放器（不需要加载字幕）</td>
+    </tr>
+    <tr>
+      <td><a href="docs/提交说明-如何复刻.md"><b>docs/提交说明-如何复刻.md</b></a></td>
+      <td>复现总说明：三条路径、环境要求、逐项验证清单、常见问题、<b>我们没说能复现的部分</b></td>
+      <td>记事本 / VSCode</td>
+    </tr>
+    <tr>
+      <td><code>run.bat</code> / <code>run.ps1</code></td>
+      <td>一键启动（建环境 → 装依赖 → 装演示数据 → 起服务）；<code>run.bat -DryRun</code> 只检查不安装</td>
+      <td>双击 <code>run.bat</code></td>
+    </tr>
+    <tr>
+      <td><code>seed/</code></td>
+      <td>10 条<b>真实运行记录</b>（含全绿数据管道、质量门禁、值班周报、Excel 报表、熔断转人工、真实失败）+ 35 个交付文件。没有 API Key 也能看</td>
+      <td>启动后左侧「最近任务」</td>
+    </tr>
+    <tr>
+      <td><code>scripts/verify/</code></td>
+      <td>离线自检 <code>verify_env.py</code>（解释器/依赖/文件/运行库/端口/Key/160 项单测）与四层真跑验证脚本 <code>verify_matrix.py</code></td>
+      <td>命令行</td>
+    </tr>
+    <tr>
+      <td><code>core/ ui/ agents/ workflows/ tests/ examples/</code></td>
+      <td>平台源码：工作流引擎、调度器、沙箱执行、可视化画布、控制台；5 个 Agent 定义、6 条工作流、160 项单测、真跑输入数据</td>
+      <td>任意编辑器</td>
+    </tr>
+  </table>
+</section>
+
+<section>
+  <h2>2. 想验证它真的能跑：两条命令</h2>
+
+  <h3>① 先干跑（不安装、不改文件，只看环境对不对）</h3>
+  <pre>run.bat -DryRun</pre>
+  <p class="muted">会打印：找到哪个 Python、有没有 .venv、依赖装了没、.env 和演示数据在不在、将执行什么命令。</p>
+
+  <h3>② 真正启动</h3>
+  <pre>run.bat</pre>
+  <p>浏览器打开 <code>http://127.0.0.1:8507</code>，左侧「最近任务」里直接打开这些真实记录：</p>
+  <table>
+    <tr><th>地址</th><th>看什么</th></tr>
+    <tr><td><code>http://127.0.0.1:8507/?trace=43d6b6a9</code></td><td>数据管道全绿：两条支线并行 + 汇合，8 节点完成、4 份交付物、tokens/步数都有</td></tr>
+    <tr><td><code>http://127.0.0.1:8507/?trace=43cbcac1</code></td><td><b>熔断 → 人工一句话 → 预算重置 → 第三次通过</b>（人工干预完整链路）</td></tr>
+    <tr><td><code>http://127.0.0.1:8507/?trace=d70f9e90</code></td><td><b>真实失败</b>：模型没按规格输出、缺断言段，引擎拒绝执行（不是伪装成功）</td></tr>
+    <tr><td><code>http://127.0.0.1:8507/?trace=c670d464</code></td><td>数据质量门禁：断言写的是业务不变量（行数/金额/地区/渠道）</td></tr>
+  </table>
+
+  <h3>③ 离线自检（不联网、不调模型）</h3>
+  <pre>python scripts/verify/verify_env.py --with-tests
+python scripts/verify/verify_matrix.py</pre>
+  <p class="ok">预期：<b>160 项测试全部通过</b>；<b>控制结构矩阵 14/14 通过</b>。</p>
+
+  <div class="warn" style="margin-top:16px">
+    <b>本包是「离线版」吗？</b> 看根目录有没有 <code>runtime\python314\</code>。<br>
+    有 → 内部已带 Python 3.14.6 与全部依赖，<b>不需要装 Python、不需要联网</b>，双击 <code>run.bat</code> 即可。<br>
+    没有（常规版）→ 需要 Python 3.11~3.14，首次启动会 pip 装约 60 MB 依赖（脚本内置清华镜像重试）。
+  </div>
+</section>
+
+<section>
+  <h2>3. 常见问题（先看这四条，能省掉 90% 的麻烦）</h2>
+  <ul>
+    <li><b>双击 run.bat 闪退</b> → 装 Python 3.11+ 并勾选 “Add python.exe to PATH”，重开窗口；或直接用离线版。</li>
+    <li><b>提示「引擎未启动 —— 已有引擎在运行」</b> → 上次进程没退干净（引擎有单写者租约）。关掉旧窗口/进程后重开。</li>
+    <li><b>启动任务报 Key 相关错误</b> → 没填 <code>.env</code> 里的 <code>DEEPSEEK_API_KEY</code>。不填 Key 只影响“发起新任务”，看演示数据与跑单测不受影响。</li>
+    <li><b>端口 8507 被占用</b> → 关掉占用进程，或改用 <code>--server.port 8508</code> 启动。</li>
+  </ul>
+</section>
+
+<section>
+  <h2>4. 我们明确写出来的限制（不是隐瞒）</h2>
+  <ul>
+    <li><b>真跑结果不是逐字节确定</b>：大模型有随机性，可复现的是流程形态与验收结论（节点状态、断言结果、产物结构），不是每句话。</li>
+    <li><b>没有向量检索（RAG）</b>：DeepSeek 未提供 embedding 接口；方案书里写清了加它的条件。</li>
+    <li><b>沙箱是进程级</b>（子进程 + 独立 venv + 工作区隔离），不是容器级。</li>
+    <li><b>画布不是自由拖拽编辑器</b>：它是 YAML 的可视化入口（节点字段编辑 + 增删 + 实时预览），不支持拖拽连线。</li>
+    <li><b><code>sub_workflow</code> 子工作流节点未实现</b>：YAML 里写了会<b>显式报错</b>，不会静默跳过。</li>
+    <li><b>没有 CI / Dockerfile</b>：以 <code>run.bat</code> + <code>verify_env.py</code> 替代，Windows 本地即可验证。</li>
+  </ul>
+</section>
+
+<section>
+  <h2>5. 这个包是怎么被验证过的</h2>
+  <p>打包脚本 <code>scripts/package_submission.py</code> 每次都会：① 逐文件算 SHA256 写进包根 <code>MANIFEST.txt</code>；
+     ② 解压到临时干净目录；③ 跑 <code>verify_env.py --with-tests</code> 与 <code>verify_matrix.py</code>；
+     ④ 装演示数据后核对 trace 数 / 日志数 / 交付文件数；⑤ 检查 <code>run.bat</code> 纯 ASCII、<code>run.ps1</code> 带 BOM
+     并实跑 <code>run.bat -DryRun</code>。<b>任何一项不过就不出包</b>——所以你解压看到的，就是被验证过的那一份。</p>
+  <p class="muted">遇到解压异常时，可用 <code>MANIFEST.txt</code> 里的 SHA256 对比，判断是传输损坏还是包本身问题。</p>
+</section>
+
+<p class="muted" style="text-align:center;margin-top:26px">
+  Aegis · 编排即数据：一条流水线怎么跑写在 YAML 里，模型写的代码能不能算“通过”由物理断言裁决，而不是模型自己说。
+</p>
+
+</div>
+</body>
+</html>
